@@ -49,8 +49,8 @@ async fn main() -> std::io::Result<()> {
     // 設定を作成 (例)
     let config = ConnectionConfig::default(); // 必要に応じて設定をカスタマイズ
 
-    // NoiseResilientProtocol のインスタンスを作成 (修正後の `new` を想定)
-    let protocol = NoiseResilientProtocol::with_config(udp_bind_addr, config).await?; // `new` が async になっている場合
+    // NoiseResilientProtocol のインスタンスを作成
+    let protocol = NoiseResilientProtocol::with_config(udp_bind_addr, config).await?;
 
     // Arc<Mutex<...>> でラップして共有可能にする
     let shared_protocol: AppState = Arc::new(Mutex::new(protocol));
@@ -61,39 +61,38 @@ async fn main() -> std::io::Result<()> {
     let protocol_clone_server = Arc::clone(&shared_protocol);
     tokio::spawn(async move {
         tracing::info!("Starting protocol server task...");
-        // ロックを取得してサーバーを開始 (start_server は async fn である想定)
-        let mut protocol_guard = protocol_clone_server.lock().await;
-        if let Err(e) = protocol_guard.start_server().await { // `start_server` が async fn になっている想定
-            tracing::error!("Failed to start protocol server: {}", e);
+        // タスク内部でロックを取得
+        let protocol_guard = protocol_clone_server.lock().await;
+        if let Err(e) = protocol_guard.start_server().await {
+            tracing::error!("Failed to start protocol server task: {}", e);
         }
-        // ロックを解放
-        drop(protocol_guard);
-        tracing::info!("Protocol server task finished/exited."); // 通常はループするためここには来ないはず
+        // ロックを解放 (drop(protocol_guard) は不要、スコープを抜ければ解放される)
+        // start_server 内でループするため、通常ここには到達しない
+        tracing::info!("Protocol server task initiation complete (running in background).");
     });
 
     // メンテナンス処理タスク
     let protocol_clone_maintenance = Arc::clone(&shared_protocol);
     tokio::spawn(async move {
         tracing::info!("Starting protocol maintenance task...");
-        // ロックを取得してメンテナンスを開始 (start_maintenance は async fn である想定)
-        let mut protocol_guard = protocol_clone_maintenance.lock().await;
-        if let Err(e) = protocol_guard.start_maintenance().await { // `start_maintenance` が async fn になっている想定
-             tracing::error!("Failed to start protocol maintenance: {}", e);
+        // タスク内部でロックを取得
+        let protocol_guard = protocol_clone_maintenance.lock().await;
+        if let Err(e) = protocol_guard.start_maintenance().await {
+             tracing::error!("Failed to start protocol maintenance task: {}", e);
         }
-         // ロックを解放
-        drop(protocol_guard);
-        tracing::info!("Protocol maintenance task finished/exited."); // 通常はループするためここには来ないはず
+         // ロックを解放 (drop(protocol_guard) は不要)
+         // start_maintenance 内でループするため、通常ここには到達しない
+        tracing::info!("Protocol maintenance task initiation complete (running in background).");
     });
 
     // データ受信処理タスク
     let protocol_clone_receiver = Arc::clone(&shared_protocol);
     tokio::spawn(async move {
         tracing::info!("Starting protocol receiver task...");
-        // ロックを取得して受信ループを開始 (start_receiver は async fn で、非同期コールバックを受け取る想定)
-        let mut protocol_guard = protocol_clone_receiver.lock().await;
+        // タスク内部でロックを取得
+        let protocol_guard = protocol_clone_receiver.lock().await;
 
         // 非同期コールバックを定義
-        // FnMut を使う場合、コールバック内で非同期処理を行うために `async move` ブロックと `tokio::spawn` が必要になることが多い
         let callback = move |addr: SocketAddr, data: Vec<u8>| {
             // save_document_to_db は async なので、新しいタスクで実行
             tokio::spawn(async move {
@@ -101,13 +100,13 @@ async fn main() -> std::io::Result<()> {
             });
         };
 
-        // start_receiver を呼び出す (非同期コールバックを渡す想定)
-        if let Err(e) = protocol_guard.start_receiver(callback).await { // `start_receiver` が async fn になっている想定
-            tracing::error!("Failed to start protocol receiver: {}", e);
+        // start_receiver を呼び出す (async になったメソッドを呼ぶ)
+        if let Err(e) = protocol_guard.start_receiver(callback).await {
+            tracing::error!("Failed to start protocol receiver task: {}", e);
         }
-         // ロックを解放
-        drop(protocol_guard);
-        tracing::info!("Protocol receiver task finished/exited."); // 通常はループするためここには来ないはず
+         // ロックを解放 (drop(protocol_guard) は不要)
+         // start_receiver 内でループするため、通常ここには到達しない
+        tracing::info!("Protocol receiver task initiation complete (running in background).");
     });
 
     // --- Axum Webサーバーの設定 ---
@@ -115,12 +114,15 @@ async fn main() -> std::io::Result<()> {
         .route("/", get(root_handler))
         // .route("/status", get(status_handler)) // 例: プロトコルの状態を表示するエンドポイント
         // .route("/send", post(send_handler))   // 例: デバイスにメッセージを送るエンドポイント
-        .with_state(Arc::clone(&shared_protocol)); // プロトコルの状態を共有 (Arc をクローンして渡す)
+        .with_state(Arc::clone(&shared_protocol)); // プロトコルの状態を共有
 
     // サーバーを起動
     tracing::info!("Web server listening on http://{}", web_bind_addr);
     let listener = tokio::net::TcpListener::bind(web_bind_addr).await?;
     axum::serve(listener, app).await?;
+
+    // Optional: Graceful shutdown handling for protocol tasks can be added here
+    // Example: signal handling to call protocol.stop().await
 
     Ok(())
 }
