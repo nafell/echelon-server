@@ -1,0 +1,57 @@
+flowchart TD
+    subgraph "External Systems"
+        App["Application / CLI layer"]:::external
+        Peer["Remote Peer"]:::external
+        Network["Network"]:::external
+    end
+
+    subgraph "Utility Modules"
+        Config["ConnectionConfig"]:::utility
+        Formatter["PacketFormatter"]:::utility
+        CargoToml["Cargo.toml"]:::utility
+        CargoLock["Cargo.lock"]:::utility
+        Readme["README.md"]:::utility
+    end
+
+    subgraph "Core Protocol Logic"
+        PEC["ProtocolEngine"]:::core
+        RM["RetransmissionManager"]:::core
+        RB["ReceiveBuffer"]:::core
+        TM["TimerManager"]:::core
+    end
+
+    subgraph "Transport Layer"
+        UDPSocket["UDP Socket Abstraction"]:::transport
+    end
+
+    App -->|"start"| PEC
+    Config -->|"injected"| PEC
+    PEC -->|"format packet"| Formatter
+    Formatter -->|"build packet"| UDPSocket
+    UDPSocket -->|"send datagram"| Network
+    Network -->|"deliver"| Peer
+    Peer -->|"send datagram"| Network
+    Network -->|"receive"| UDPSocket
+    UDPSocket -->|"raw packet"| PEC
+    PEC -->|"buffer packet"| RB
+    PEC -->|"track packets"| RM
+    PEC -->|"set timers"| TM
+    TM -->|"timeout event"| PEC
+    RB -->|"deliver data"| App
+
+    click App "https://github.com/nafell/echelon-server/blob/main/src/main.rs"
+    click PEC "https://github.com/nafell/echelon-server/blob/main/src/protocol.rs"
+    click Formatter "https://github.com/nafell/echelon-server/blob/main/src/protocol.rs"
+    click RM "https://github.com/nafell/echelon-server/blob/main/src/protocol.rs"
+    click RB "https://github.com/nafell/echelon-server/blob/main/src/protocol.rs"
+    click TM "https://github.com/nafell/echelon-server/blob/main/src/protocol.rs"
+    click UDPSocket "https://github.com/nafell/echelon-server/blob/main/src/protocol.rs"
+    click Config "https://github.com/nafell/echelon-server/blob/main/src/protocol.rs"
+    click CargoToml "https://github.com/nafell/echelon-server/blob/main/Cargo.toml"
+    click CargoLock "https://github.com/nafell/echelon-server/blob/main/Cargo.lock"
+    click Readme "https://github.com/nafell/echelon-server/blob/main/README.md"
+
+    classDef core fill:#d4f7c5,stroke:#333
+    classDef utility fill:#e2e2e2,stroke:#333
+    classDef transport fill:#c5e4f7,stroke:#333
+    classDef external fill:#f7d4c5,stroke:#333
