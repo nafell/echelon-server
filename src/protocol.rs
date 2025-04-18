@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
-use std::net::{SocketAddr, UdpSocket};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::net::UdpSocket;
+use tokio::time::{sleep, Duration, Instant};
+use tokio::task;
 
 // パケットタイプの定義
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -185,9 +187,9 @@ enum ConnectionState {
     Disconnecting,
 }
 
-// 接続設定
+// 接続設定 (pub に変更)
 #[derive(Clone)]
-struct ConnectionConfig {
+pub struct ConnectionConfig {
     // 基本的なRTT (初期値)
     initial_rtt: Duration,
     // 最小再送タイムアウト
@@ -239,7 +241,7 @@ struct Connection {
     // 受信済みパケット
     received_packets: HashMap<u32, Vec<u8>>,
     
-    // タイムスタンプ
+    // タイムスタンプ (tokio::time::Instant を使用)
     last_activity: Instant,
     created_at: Instant,
 }
@@ -256,7 +258,7 @@ impl Connection {
             next_expected_seq: 0,
             rtt: initial_rtt,
             rtt_var: initial_rtt / 2,
-            rto: initial_rtt * 2,
+            rto: initial_rtt * 2, // RTO計算を確認・調整する必要があるかも
             pending_packets: HashMap::new(),
             received_packets: HashMap::new(),
             last_activity: now,
@@ -264,15 +266,16 @@ impl Connection {
         }
     }
     
-    // パケット送信処理
-    fn send_packet(&mut self, socket: &UdpSocket, packet_type: PacketType, payload: Vec<u8>) -> Result<u32, Error> {
+    // パケット送信処理 (async に変更, socket は Arc<UdpSocket> を想定)
+    async fn send_packet(&mut self, socket: &UdpSocket, packet_type: PacketType, payload: Vec<u8>) -> Result<u32, Error> {
         let seq_num = self.next_seq_num;
         self.next_seq_num += 1;
         
         let packet = Packet::new(packet_type, seq_num, self.next_expected_seq, payload);
         let packet_data = packet.to_bytes();
         
-        socket.send_to(&packet_data, self.peer_addr)?;
+        // socket.send_to を使用 (async)
+        socket.send_to(&packet_data, self.peer_addr).await?;
         
         // データパケットの場合は再送用に保存
         if packet_type == PacketType::Data || packet_type == PacketType::Connect {
@@ -289,8 +292,8 @@ impl Connection {
         Ok(seq_num)
     }
     
-    // パケット受信処理
-    fn receive_packet(&mut self, packet: Packet) -> Result<Option<Vec<u8>>, Error> {
+    // パケット受信処理 (async に変更, send_packet を呼ぶため)
+    async fn receive_packet(&mut self, socket: &UdpSocket, packet: Packet) -> Result<Option<Vec<u8>>, Error> {
         self.last_activity = Instant::now();
         
         match packet.header.packet_type {
@@ -298,7 +301,9 @@ impl Connection {
                 if self.state == ConnectionState::Closed {
                     self.state = ConnectionState::Connecting;
                     self.next_expected_seq = packet.header.seq_num + 1;
-                    println!("CONNECT from {}", self.peer_addr);
+                    tracing::info!("CONNECT from {}", self.peer_addr); // println! を tracing に変更 (推奨)
+                    // 接続確認応答を送信
+                    let _ = self.send_packet(socket, PacketType::ConnectAck, Vec::new()).await?;
                     return Ok(Some(Vec::new())); // 接続要求を通知
                 }
             },
@@ -307,13 +312,18 @@ impl Connection {
                     self.state = ConnectionState::Connected;
                     // 受信確認されたパケットを削除
                     self.handle_ack(packet.header.ack_num);
-                    println!("CONNECT_ACK from {}", self.peer_addr);
+                    tracing::info!("CONNECT_ACK from {}", self.peer_addr);
                     return Ok(Some(Vec::new())); // 接続確立を通知
                 }
             },
             PacketType::Data => {
+                tracing::info!("DATA from {}", self.peer_addr);
+
+                // 常にACKを返す (重複受信でもACKは返す)
+                let ack_payload = Vec::new(); // ACKパケットにはペイロード不要
+                let _ = self.send_packet(socket, PacketType::Ack, ack_payload).await?;
+
                 // 順序どおりのパケットを処理
-                println!("DATA from {}", self.peer_addr);
                 if packet.header.seq_num == self.next_expected_seq {
                     self.next_expected_seq += 1;
                     
@@ -333,8 +343,10 @@ impl Connection {
                     
                     return Ok(Some(result));
                 } else if packet.header.seq_num > self.next_expected_seq {
-                    // 将来のパケットは保存
-                    self.received_packets.insert(packet.header.seq_num, packet.payload);
+                    // 将来のパケットは保存 (ウィンドウサイズチェックを追加すると良い)
+                    if !self.received_packets.contains_key(&packet.header.seq_num) {
+                         self.received_packets.insert(packet.header.seq_num, packet.payload);
+                    }
                     // 受信確認処理
                     self.handle_ack(packet.header.ack_num);
                 }
@@ -345,20 +357,22 @@ impl Connection {
             },
             PacketType::Ack => {
                 // 受信確認処理
-                println!("ACK from {}", self.peer_addr);
+                tracing::info!("ACK from {}", self.peer_addr);
                 self.handle_ack(packet.header.ack_num);
             },
             PacketType::Disconnect => {
-                println!("DISCONNECT from {}", self.peer_addr);
-                self.state = ConnectionState::Disconnecting;
-                return Ok(Some(Vec::new())); // 切断要求を通知
+                tracing::info!("DISCONNECT from {}", self.peer_addr);
+                // 即座にACKを返す
+                let _ = self.send_packet(socket, PacketType::Ack, Vec::new()).await?;
+                self.state = ConnectionState::Closed; // サーバー側は受信したら閉じる
+                return Ok(Some(Vec::new())); // 切断要求を通知 (データは空)
             }
         }
         
         Ok(None)
     }
     
-    // ACK処理
+    // ACK処理 (同期のままで良い)
     fn handle_ack(&mut self, ack_num: u32) {
         // ack_num以下のすべてのパケットを確認済みとする
         let mut acked_seqs = Vec::new();
@@ -396,8 +410,8 @@ impl Connection {
         }
     }
     
-    // タイムアウトしたパケットを再送
-    fn check_timeouts(&mut self, socket: &UdpSocket) -> Result<(), Error> {
+    // タイムアウトしたパケットを再送 (async に変更, socket は Arc<UdpSocket> を想定)
+    async fn check_timeouts(&mut self, socket: &UdpSocket) -> Result<(), Error> {
         let now = Instant::now();
         let mut to_retransmit = Vec::new();
         let mut to_remove = Vec::new();
@@ -416,7 +430,8 @@ impl Connection {
         for seq in to_retransmit {
             if let Some(pending) = self.pending_packets.get_mut(&seq) {
                 let packet_data = pending.packet.to_bytes();
-                socket.send_to(&packet_data, self.peer_addr)?;
+                // socket.send_to を使用 (async)
+                socket.send_to(&packet_data, self.peer_addr).await?;
                 
                 pending.last_sent = now;
                 pending.transmissions += 1;
@@ -447,117 +462,154 @@ impl Connection {
 
 // 簡易プロトコルの実装
 pub struct NoiseResilientProtocol {
-    socket: UdpSocket,
+    // socket を Arc<UdpSocket> に変更 (複数タスクから共有・利用するため)
+    socket: Arc<UdpSocket>,
+    // connections の Mutex を tokio::sync::Mutex に変更
     connections: Arc<Mutex<HashMap<SocketAddr, Connection>>>,
     config: ConnectionConfig,
+    // running フラグも Mutex で保護 (あるいは Watch channel なども検討可能)
     running: Arc<Mutex<bool>>,
 }
 
 impl NoiseResilientProtocol {
-    pub fn new(bind_addr: &str) -> Result<Self, Error> {
-        let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_nonblocking(true)?;
-        
-        Ok(Self {
-            socket,
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            config: ConnectionConfig::default(),
-            running: Arc::new(Mutex::new(true)),
-        })
-    }
+    // new は async にせず、with_config の async 版を用意
+    // pub async fn new(bind_addr: &str) -> Result<Self, Error> {
+    //     Self::with_config(bind_addr, ConnectionConfig::default()).await
+    // }
     
-    pub fn with_config(bind_addr: &str, config: ConnectionConfig) -> Result<Self, Error> {
-        let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_nonblocking(true)?;
+    // with_config を async に変更 (UdpSocket::bind が async のため)
+    pub async fn with_config(bind_addr: &str, config: ConnectionConfig) -> Result<Self, Error> {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        // set_nonblocking は Tokio の UdpSocket では不要 (常にノンブロッキング)
         
         Ok(Self {
-            socket,
+            // socket を Arc で包む
+            socket: Arc::new(socket),
             connections: Arc::new(Mutex::new(HashMap::new())),
             config,
             running: Arc::new(Mutex::new(true)),
         })
     }
     
-    // サーバーモードで起動
-    pub fn start_server(&self) -> Result<(), Error> {
-        let socket = self.socket.try_clone()?;
+    // サーバーモードで起動 (async に変更, tokio::spawn を使用)
+    pub async fn start_server(&self) -> Result<(), Error> {
+        let socket = Arc::clone(&self.socket);
         let connections = Arc::clone(&self.connections);
         let running = Arc::clone(&self.running);
-        
-        thread::spawn(move || {
-            let mut buffer = vec![0u8; 2048];
+        let config = self.config.clone(); // config も渡す
+
+        // tokio::spawn で非同期タスクを開始
+        task::spawn(async move {
+            let mut buffer = vec![0u8; 2048]; // MTUに合わせたサイズが良い
             
-            while *running.lock().unwrap() {
-                match socket.recv_from(&mut buffer) {
+            // running フラグを確認しながらループ
+            while *running.lock().await {
+                // socket.recv_from を使用 (async)
+                // select! を使って停止シグナルも待つとより良い
+                match socket.recv_from(&mut buffer).await {
                     Ok((size, src_addr)) => {
-                        if let Ok(packet) = Packet::from_bytes(&buffer[..size]) {
-                            let mut conns = connections.lock().unwrap();
-                            
-                            // 新規接続の場合
-                            if !conns.contains_key(&src_addr) && packet.header.packet_type == PacketType::Connect {
-                                let mut connection = Connection::new(src_addr, ConnectionConfig::default());
-                                connection.state = ConnectionState::Connecting;
-                                connection.next_expected_seq = packet.header.seq_num + 1;
+                        match Packet::from_bytes(&buffer[..size]) {
+                            Ok(packet) => {
+                                let mut conns = connections.lock().await;
                                 
-                                // 接続確認応答
-                                let _ = connection.send_packet(&socket, PacketType::ConnectAck, Vec::new());
-                                conns.insert(src_addr, connection);
+                                // 新規接続の場合 (CONNECT パケット受信)
+                                if packet.header.packet_type == PacketType::Connect {
+                                     if !conns.contains_key(&src_addr) {
+                                        tracing::info!("New connection attempt from {}", src_addr);
+                                        let mut connection = Connection::new(src_addr, config.clone()); // Clone config for new connection
+                                        // receive_packet 内で ConnectAck が送られるはず
+                                        match connection.receive_packet(&socket, packet).await {
+                                             Ok(Some(_)) => { // 接続要求通知 (データは空)
+                                                tracing::info!("Connection established with {}", src_addr);
+                                                conns.insert(src_addr, connection);
+                                             }
+                                             Ok(None) => {
+                                                // receive_packet が None を返すのは通常のエラーケース以外では考えにくいが、念のためログ
+                                                tracing::warn!("receive_packet returned None during connect for {}", src_addr);
+                                             }
+                                             Err(e) => {
+                                                tracing::error!("Error processing CONNECT packet from {}: {}", src_addr, e);
+                                             }
+                                        }
+                                    } else {
+                                        // 既に接続があるのにCONNECTが来た場合 (再送など)
+                                        // 既存のConnectionで処理させる (ConnectAck再送など)
+                                        if let Some(connection) = conns.get_mut(&src_addr) {
+                                            if let Err(e) = connection.receive_packet(&socket, packet).await {
+                                                 tracing::error!("Error re-processing CONNECT packet from {}: {}", src_addr, e);
+                                            }
+                                        }
+                                    }
+                                }
+                                // 既存の接続へのパケット
+                                else if let Some(connection) = conns.get_mut(&src_addr) {
+                                    // 状態が Closed でなければ処理
+                                    if connection.state != ConnectionState::Closed {
+                                        match connection.receive_packet(&socket, packet).await {
+                                            Ok(Some(data)) => {
+                                                // サーバー側では通常データ受信時の処理は不要かもしれない
+                                                // 必要ならここに処理を追加
+                                                if !data.is_empty() {
+                                                    tracing::debug!("Server received data from {}: {} bytes (discarding)", src_addr, data.len());
+                                                }
+                                            }
+                                            Ok(None) => { /* ACK受信など、データがない場合 */ }
+                                            Err(e) => {
+                                                 tracing::error!("Error processing packet from {}: {}", src_addr, e);
+                                            }
+                                        }
+                                    } else {
+                                         tracing::warn!("Received packet from already closed connection: {}", src_addr);
+                                    }
+
+                                    // タイムアウトチェック (エラーはログ出力)
+                                    // check_timeouts はロックの外で行うべきかもしれないが、ここでは簡単化のため内側で実行
+                                    // if let Err(e) = connection.check_timeouts(&socket).await {
+                                    //     tracing::error!("Timeout check error for {}: {}", src_addr, e);
+                                    // }
+
+                                    // Note: 接続削除はメンテナンスで行うため、ここでは削除しない
+                                } else {
+                                     tracing::warn!("Received packet from unknown source without CONNECT: {}", src_addr);
+                                     // 不明な送信元からのパケットは無視するか、エラー応答を返すか検討
+                                }
                             }
-                            // 既存の接続
-                            else if let Some(connection) = conns.get_mut(&src_addr) {
-                                if let Ok(Some(_)) = connection.receive_packet(packet) {
-                                    // データ受信時の処理（サーバー側での実装）
-                                    
-                                    // 接続確認応答
-                                    if connection.state == ConnectionState::Connecting {
-                                        let _ = connection.send_packet(&socket, PacketType::ConnectAck, Vec::new());
-                                    }
-                                    
-                                    // 切断確認応答
-                                    if connection.state == ConnectionState::Disconnecting {
-                                        let _ = connection.send_packet(&socket, PacketType::Ack, Vec::new());
-                                        connection.state = ConnectionState::Closed;
-                                    }
-                                }
-                                
-                                // タイムアウトチェック
-                                let _ = connection.check_timeouts(&socket);
-                                
-                                // 切断された接続を削除
-                                if connection.state == ConnectionState::Closed {
-                                    // 実際の実装では定期的なクリーンアップで削除する方が良い
-                                }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse packet from {}: {}", src_addr, e);
                             }
                         }
                     },
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        // ノンブロッキングなので、データがないときはここに来る
-                        thread::sleep(Duration::from_millis(10));
-                    },
+                    // WouldBlock の代わりにタイムアウトやエラーを処理
                     Err(e) => {
-                        eprintln!("受信エラー: {}", e);
+                        // エラーの種類に応じて処理 (例: ICMPエラーなど)
+                        tracing::error!("Socket recv_from error: {}", e);
+                        // エラーによってはループを継続できない場合もある
+                        // sleep を入れて CPU 使用率の上昇を防ぐ
+                        sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
+            tracing::info!("Server task shutting down.");
         });
         
         Ok(())
     }
     
-    // クライアントとして接続
-    pub fn connect(&self, server_addr: &str) -> Result<(), Error> {
-        let addr: SocketAddr = server_addr.parse().map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-        let mut connections = self.connections.lock().unwrap();
+    // クライアントとして接続 (async に変更)
+    pub async fn connect(&self, server_addr: &str) -> Result<(), Error> {
+        let addr: SocketAddr = server_addr.parse().map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid server address: {}", e)))?;
+        let mut connections = self.connections.lock().await; // Acquire lock asynchronously
         
         if connections.contains_key(&addr) {
             return Err(Error::new(ErrorKind::AlreadyExists, "既に接続されています"));
         }
         
-        let socket_clone = self.socket.try_clone()?;
+        // socket は Arc なので clone するだけ
+        let socket = Arc::clone(&self.socket);
         let mut connection = Connection::new(addr, self.config.clone());
         
-        // 接続要求を送信
-        connection.send_packet(&socket_clone, PacketType::Connect, Vec::new())?;
+        // 接続要求を送信 (async)
+        connection.send_packet(&socket, PacketType::Connect, Vec::new()).await?;
         connection.state = ConnectionState::Connecting;
         
         connections.insert(addr, connection);
@@ -565,9 +617,10 @@ impl NoiseResilientProtocol {
         Ok(())
     }
 
-    pub fn isConnected(&self, server_addr: &str) -> Result<bool, Error> {
-        let addr: SocketAddr = server_addr.parse().map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-        let connections = self.connections.lock().unwrap();
+    // isConnected (async に変更, Mutex lock のため)
+    pub async fn is_connected(&self, server_addr: &str) -> Result<bool, Error> {
+        let addr: SocketAddr = server_addr.parse().map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid server address: {}", e)))?;
+        let connections = self.connections.lock().await; // Acquire lock asynchronously
         if let Some(connection) = connections.get(&addr) {
             Ok(connection.state == ConnectionState::Connected)
         } else {
@@ -575,10 +628,10 @@ impl NoiseResilientProtocol {
         }
     }
     
-    // クライアントとしてデータ送信
-    pub fn send(&self, server_addr: &str, data: &[u8]) -> Result<(), Error> {
-        let addr: SocketAddr = server_addr.parse().map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-        let mut connections = self.connections.lock().unwrap();
+    // クライアントとしてデータ送信 (async に変更)
+    pub async fn send(&self, server_addr: &str, data: &[u8]) -> Result<(), Error> {
+        let addr: SocketAddr = server_addr.parse().map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid server address: {}", e)))?;
+        let mut connections = self.connections.lock().await; // Acquire lock asynchronously
         
         if let Some(connection) = connections.get_mut(&addr) {
             if connection.state != ConnectionState::Connected {
@@ -586,11 +639,16 @@ impl NoiseResilientProtocol {
             }
             
             // データを適切なサイズに分割
-            let chunks = data.chunks(self.config.max_packet_size - 16);
-            let socket_clone = self.socket.try_clone()?;
+            // ヘッダサイズ(16)を考慮
+            let max_payload_size = self.config.max_packet_size.saturating_sub(16);
+            if max_payload_size == 0 {
+                 return Err(Error::new(ErrorKind::InvalidInput, "max_packet_size is too small"));
+            }
+            let chunks = data.chunks(max_payload_size);
+            let socket = Arc::clone(&self.socket); // socket を clone
             
             for chunk in chunks {
-                connection.send_packet(&socket_clone, PacketType::Data, chunk.to_vec())?;
+                connection.send_packet(&socket, PacketType::Data, chunk.to_vec()).await?;
             }
             
             Ok(())
@@ -599,16 +657,18 @@ impl NoiseResilientProtocol {
         }
     }
     
-    // クライアントとして切断
-    pub fn disconnect(&self, server_addr: &str) -> Result<(), Error> {
-        let addr: SocketAddr = server_addr.parse().map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-        let mut connections = self.connections.lock().unwrap();
+    // クライアントとして切断 (async に変更)
+    pub async fn disconnect(&self, server_addr: &str) -> Result<(), Error> {
+        let addr: SocketAddr = server_addr.parse().map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid server address: {}", e)))?;
+        let mut connections = self.connections.lock().await; // Acquire lock asynchronously
         
         if let Some(connection) = connections.get_mut(&addr) {
-            if connection.state == ConnectionState::Connected {
-                let socket_clone = self.socket.try_clone()?;
-                connection.send_packet(&socket_clone, PacketType::Disconnect, Vec::new())?;
+            if connection.state == ConnectionState::Connected || connection.state == ConnectionState::Connecting {
+                let socket = Arc::clone(&self.socket); // socket を clone
+                connection.send_packet(&socket, PacketType::Disconnect, Vec::new()).await?;
                 connection.state = ConnectionState::Disconnecting;
+                // Disconnect 送信後、即座に削除せず、ACKを待つかタイムアウトで削除 (メンテナンス処理で行う)
+                 tracing::info!("DISCONNECT sent to {}", addr);
             }
             Ok(())
         } else {
@@ -616,192 +676,139 @@ impl NoiseResilientProtocol {
         }
     }
     
-    // 受信ループ開始（S/C共通）
-    pub fn start_receiver<F>(&self, mut callback: F) -> Result<(), Error>
+    // 受信ループ開始（async に変更, tokio::spawn, FnMut + Send + 'static のまま）
+    // 注意: callback 内で非同期処理を行う場合は、callback 側で tokio::spawn する必要がある
+    pub async fn start_receiver<F>(&self, mut callback: F) -> Result<(), Error>
     where
-        F: FnMut(SocketAddr, Vec<u8>) + Send + 'static,
+        F: FnMut(SocketAddr, Vec<u8>) + Send + Sync + 'static, // Sync を追加 (Arc<Mutex<..>> 内で使うため)
     {
-        let socket = self.socket.try_clone()?;
+        let socket = Arc::clone(&self.socket);
         let connections = Arc::clone(&self.connections);
         let running = Arc::clone(&self.running);
-        
-        thread::spawn(move || {
-            let mut buffer = vec![0u8; 2048];
-            
-            while *running.lock().unwrap() {
-                match socket.recv_from(&mut buffer) {
+        let callback = Arc::new(Mutex::new(callback)); // CallbackもArc<Mutex>で包む
+
+        // tokio::spawn で非同期タスクを開始
+        task::spawn(async move {
+            let mut buffer = vec![0u8; 2048]; // MTUに合わせたサイズが良い
+
+            while *running.lock().await {
+                 // select! を使って停止シグナルも待つとより良い
+                match socket.recv_from(&mut buffer).await {
                     Ok((size, src_addr)) => {
-                        if let Ok(packet) = Packet::from_bytes(&buffer[..size]) {
-                            let mut conns = connections.lock().unwrap();
-                            
-                            if let Some(connection) = conns.get_mut(&src_addr) {
-                                if let Ok(Some(data)) = connection.receive_packet(packet) {
-                                    // 空でないデータを受信したらコールバック
-                                    if !data.is_empty() {
-                                        callback(src_addr, data);
+                         match Packet::from_bytes(&buffer[..size]) {
+                             Ok(packet) => {
+                                let mut conns_guard = connections.lock().await;
+                                if let Some(connection) = conns_guard.get_mut(&src_addr) {
+                                    // 状態が Closed でなければ処理
+                                    if connection.state != ConnectionState::Closed {
+                                         match connection.receive_packet(&socket, packet).await {
+                                            Ok(Some(data)) => {
+                                                if !data.is_empty() {
+                                                    // コールバック呼び出し (ロックを取得して呼び出す)
+                                                    let mut cb_guard = callback.lock().await;
+                                                    (*cb_guard)(src_addr, data);
+                                                    // コールバック実行中は connections のロックを解放したい場合、
+                                                    // データを clone してロック解除後に cb を呼ぶ等の工夫が必要
+                                                }
+                                                // 接続確立時や切断完了時の通知は receive_packet 内で行うか、
+                                                // state の変化を監視する別の仕組みが必要
+                                            }
+                                            Ok(None) => { /* ACK受信など */ }
+                                            Err(e) => {
+                                                tracing::error!("Error processing packet in receiver from {}: {}", src_addr, e);
+                                            }
+                                        }
+                                    } else {
+                                         // tracing::warn!("Receiver received packet from already closed connection: {}", src_addr);
                                     }
-                                    
-                                    // 接続確立時
-                                    if connection.state == ConnectionState::Connected {
-                                        // ここでユーザーに通知
-                                    }
-                                    
-                                    // 切断確認時
-                                    if connection.state == ConnectionState::Closed {
-                                        // ここでユーザーに通知
-                                    }
+                                } else {
+                                     // サーバータスクで処理されるはずなので、ここでは通常何もしない
+                                     // tracing::warn!("Receiver received packet from unknown source: {}", src_addr);
                                 }
-                                
-                                // タイムアウトチェック
-                                let _ = connection.check_timeouts(&socket);
-                            }
-                        }
-                    },
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        // ノンブロッキングなので、データがないときはここに来る
-                        thread::sleep(Duration::from_millis(10));
+                             }
+                             Err(e) => {
+                                 tracing::warn!("Receiver failed to parse packet from {}: {}", src_addr, e);
+                             }
+                         }
                     },
                     Err(e) => {
-                        eprintln!("受信エラー: {}", e);
+                        tracing::error!("Receiver socket recv_from error: {}", e);
+                        sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
+            tracing::info!("Receiver task shutting down.");
         });
         
         Ok(())
     }
     
-    // 定期的なメンテナンス処理
-    pub fn start_maintenance(&self) -> Result<(), Error> {
+    // 定期的なメンテナンス処理 (async に変更, tokio::spawn, tokio::time::sleep)
+    pub async fn start_maintenance(&self) -> Result<(), Error> {
         let connections = Arc::clone(&self.connections);
-        let socket = self.socket.try_clone()?;
+        let socket = Arc::clone(&self.socket); // socket も渡す (check_timeouts で必要)
         let running = Arc::clone(&self.running);
-        
-        thread::spawn(move || {
-            while *running.lock().unwrap() {
-                {
-                    let mut conns = connections.lock().unwrap();
+        let maintenance_interval = Duration::from_millis(100); // インターバル
+
+        // tokio::spawn で非同期タスクを開始
+        task::spawn(async move {
+            while *running.lock().await {
+                // インターバルの開始時刻
+                let start = Instant::now();
+                
+                { // Mutex のスコープを限定
+                    let mut conns = connections.lock().await;
                     let mut to_remove = Vec::new();
                     
                     for (addr, connection) in conns.iter_mut() {
-                        // タイムアウトチェック
-                        if let Err(e) = connection.check_timeouts(&socket) {
-                            eprintln!("タイムアウトチェックエラー: {} for {}", e, addr);
+                        // タイムアウトチェック (async に変更)
+                        if let Err(e) = connection.check_timeouts(&socket).await {
+                            tracing::error!("Timeout check error for {}: {}", addr, e);
+                            // エラーによっては接続を切断する必要があるかもしれない
+                            // 例: 何度も再送に失敗した場合など
+                            if connection.state != ConnectionState::Closed {
+                                 tracing::warn!("Closing connection {} due to timeout check error: {}", addr, e);
+                                connection.state = ConnectionState::Closed; // 強制的に閉じる
+                            }
                         }
                         
-                        // 切断済み接続を削除
-                        if connection.state == ConnectionState::Closed {
+                        // 切断済み接続、またはタイムアウトした接続を削除対象に
+                        if connection.state == ConnectionState::Closed || 
+                           (connection.state != ConnectionState::Connected && connection.created_at.elapsed() > connection.config.connection_timeout * 2) || // 接続試行タイムアウト
+                           (connection.state == ConnectionState::Connected && connection.last_activity.elapsed() > connection.config.connection_timeout) // アイドルタイムアウト
+                         {
+                            if connection.state != ConnectionState::Closed {
+                                tracing::info!("Connection timed out for {}", addr);
+                                connection.state = ConnectionState::Closed; // 削除前に状態を Closed に
+                            }
                             to_remove.push(*addr);
                         }
                     }
                     
-                    // 切断済み接続を削除
+                    // 切断済み接続を実際に削除
                     for addr in to_remove {
+                        tracing::info!("Removing closed/timed-out connection: {}", addr);
                         conns.remove(&addr);
                     }
-                }
+                } // Mutex ロック解放
                 
-                thread::sleep(Duration::from_millis(100));
+                // 次の実行まで待機 (処理時間を考慮)
+                let elapsed = start.elapsed();
+                if elapsed < maintenance_interval {
+                    sleep(maintenance_interval - elapsed).await;
+                }
             }
+             tracing::info!("Maintenance task shutting down.");
         });
         
         Ok(())
     }
     
-    // プロトコルの停止
-    pub fn stop(&self) {
-        let mut running = self.running.lock().unwrap();
+    // プロトコルの停止 (async に変更, Mutex lock のため)
+    pub async fn stop(&self) {
+        let mut running = self.running.lock().await;
         *running = false;
+        // TODO: 必要であれば、各タスクにシャットダウン通知を送り、完了を待つ処理を追加
+        tracing::info!("Stop signal sent.");
     }
 }
-
-// 使用例
-fn example_usage() {
-    // サーバー側
-    let server = NoiseResilientProtocol::new("127.0.0.1:12345").unwrap();
-    server.start_server().unwrap();
-    server.start_maintenance().unwrap();
-    
-    // クライアント側
-    let client = NoiseResilientProtocol::new("127.0.0.1:0").unwrap();
-    client.connect("127.0.0.1:12345").unwrap();
-    
-    // データ受信コールバック
-    client.start_receiver(|addr, data| {
-        println!("{}からデータを受信: {:?}", addr, data);
-    }).unwrap();
-    
-    // データ送信
-    thread::sleep(Duration::from_secs(1)); // 接続待ち
-    client.send("127.0.0.1:12345", b"Hello, world!").unwrap();
-    
-    // 切断
-    thread::sleep(Duration::from_secs(5));
-    client.disconnect("127.0.0.1:12345").unwrap();
-    
-    // 停止
-    thread::sleep(Duration::from_secs(1));
-    client.stop();
-    server.stop();
-}
-
-pub fn server() {
-    let server = NoiseResilientProtocol::new("127.0.0.1:12345").unwrap();
-    server.start_server().unwrap();
-    server.start_maintenance().unwrap();
-
-    server.start_receiver(|addr, data| {
-        println!("Server received data from {}: {}", addr, String::from_utf8_lossy(&data));
-    }).unwrap();
-    println!("Server started, waiting for connections...");
-
-    // クライアントからのメッセージ受信などを待機 (デモのためしばらく待つ)
-    println!("Server waiting for client message or timeout...");
-    thread::sleep(Duration::from_secs(30));
-    println!("Server shutting down.");
-    server.stop();
-}
-
-pub fn client() {
-    let client = NoiseResilientProtocol::new("127.0.0.1:0").unwrap();
-    let server_addr = "127.0.0.1:12345";
-
-    // データ受信コールバックを設定
-    client.start_receiver(|addr, data| {
-        println!("Client received data from {}: {}", addr, String::from_utf8_lossy(&data));
-    }).unwrap();
-    println!("Client started, waiting for connections...");
-
-    println!("Client connecting to {}...", server_addr);
-    match client.connect(server_addr) {
-        Ok(_) => println!("Client connection initiated to {}.", server_addr),
-        Err(e) => {
-            eprintln!("Client connect error: {}", e);
-            client.stop();
-            return;
-        }
-    }
-
-    // 接続が確立(CONNECT_ACKを受信)するまで待つ 
-    // while !client.isConnected(server_addr).unwrap() {
-    //     println!("Waiting CONNECT_ACK from {}...", server_addr);
-    //     thread::sleep(Duration::from_secs(1));
-    // }
-
-    // 接続待ち(デモ)
-    println!("Waiting for ACK...");
-    thread::sleep(Duration::from_secs(2));
-
-    println!("Client sending message to {}...", server_addr);
-    match client.send(server_addr, b"Hello from client!") {
-        Ok(_) => println!("Client sent message."),
-        Err(e) => eprintln!("Client send error: {}", e),
-    }
-
-    // 送信完了を待つ
-    thread::sleep(Duration::from_secs(5));
-    
-    println!("Client shutting down.");
-    client.stop();
-}
-
