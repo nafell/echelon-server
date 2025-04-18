@@ -9,11 +9,14 @@ use std::net::SocketAddr;
 use std::sync::Arc; // std::sync::Arc を使用
 use tokio::sync::Mutex; // Mutex は Tokio のものを使用
 use std::time::Duration;
+use clap::Parser; // clap をインポート
 
 // 注意: protocol モジュール内の NoiseResilientProtocol 及び関連する型は、
 //       Tokio ベース (async/await, tokio::net::UdpSocket, tokio::time::sleep, tokio::spawn)
 //       へ修正されている必要があります。
 use protocol::{NoiseResilientProtocol, ConnectionConfig}; // 必要に応じて ConnectionConfig もインポート
+
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // DB保存処理のプレースホルダー (非同期関数として定義)
 async fn save_document_to_db(peer_addr: SocketAddr, data: Vec<u8>) {
@@ -25,104 +28,238 @@ async fn save_document_to_db(peer_addr: SocketAddr, data: Vec<u8>) {
     // println!("DB save complete for {}", peer_addr);
 }
 
-// アプリケーションの状態
-// NoiseResilientProtocol を Tokio の Mutex で保護し、Arc で共有
-type AppState = Arc<Mutex<NoiseResilientProtocol>>;
+// アプリケーションの状態 (サーバー用)
+type ServerAppState = Arc<NoiseResilientProtocol>; // サーバーは Arc<NoiseResilientProtocol> 全体を持つ
+
+// --- コマンドライン引数の定義 ---
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Parser, Debug)]
+enum Commands {
+    /// サーバーモードで起動します
+    Server {
+        /// サーバーがリッスンするUDPアドレス:ポート
+        #[arg(short, long, default_value = "127.0.0.1:12345")]
+        bind_addr: String,
+        /// Web UIサーバーがリッスンするTCPアドレス:ポート
+        #[arg(short, long, default_value = "127.0.0.1:8080")]
+        web_addr: String,
+    },
+    /// クライアントモードで起動し、メッセージを送信します
+    Client {
+        /// 接続先のサーバーアドレス:ポート
+        #[arg(short, long, default_value = "127.0.0.1:12345")]
+        server_addr: String,
+        /// 送信するメッセージ
+        #[arg(short, long, default_value = "Hello, protocol!")]
+        message: String,
+        /// クライアントがバインドするローカルUDPアドレス:ポート (0で自動割当)
+        #[arg(long, default_value = "0.0.0.0:0")]
+        local_addr: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     // tracing の初期化 (ロギング用)
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    tracing_subscriber::registry()
+    .with(
+      tracing_subscriber::EnvFilter::try_from_default_env()
+      .unwrap_or_else(|_| "debug".into()),
+    )
+    .with(tracing_subscriber::fmt::layer())
+    .init();
+    // ログレベル設定の参考サイト: https://blog.ojisan.io/rust-tracing/
 
-    let udp_bind_addr = "127.0.0.1:12345"; // UDPサーバーのアドレス
-    let web_bind_addr = "127.0.0.1:8080"; // Webサーバーのアドレス
+    // コマンドライン引数をパース
+    let args = Args::parse();
+
+    match args.command {
+        Commands::Server { bind_addr, web_addr } => {
+            run_server(&bind_addr, &web_addr).await?;
+        }
+        Commands::Client { server_addr, message, local_addr } => {
+            run_client(&server_addr, &message, &local_addr).await?;
+        }
+    }
+
+    Ok(())
+}
+
+// --- サーバー実行関数 ---
+async fn run_server(udp_bind_addr: &str, web_bind_addr: &str) -> std::io::Result<()> {
+    tracing::info!("Starting server mode...");
+    tracing::info!("UDP Listening on: {}", udp_bind_addr);
+    tracing::info!("Web UI Listening on: {}", web_bind_addr);
 
     // --- NoiseResilientProtocol の準備 ---
-    // 注意: このコードが正しく動作するには、`protocol.rs` 内の NoiseResilientProtocol が
-    //       Tokio の非同期機能 (`tokio::net::UdpSocket`, `tokio::time::sleep`, `tokio::spawn`, `async fn`)
-    //       を使用するように大幅に修正されている必要があります。
-    //       以下の `new`, `start_server`, `start_maintenance`, `start_receiver` は
-    //       非同期に対応したシグネチャを持つ想定です。
-
-    // 設定を作成 (例)
-    let config = ConnectionConfig::default(); // 必要に応じて設定をカスタマイズ
-
-    // NoiseResilientProtocol のインスタンスを作成
+    let config = ConnectionConfig::default();
     let protocol = NoiseResilientProtocol::with_config(udp_bind_addr, config).await?;
-
-    // Arc<Mutex<...>> でラップして共有可能にする
-    let shared_protocol: AppState = Arc::new(Mutex::new(protocol));
+    let shared_protocol: ServerAppState = Arc::new(protocol); // Mutex 不要、Protocol内部で管理
 
     // --- プロトコル処理の非同期タスクを開始 ---
-
-    // サーバー処理タスク
+    // Arc をクローンして各タスクに渡す
     let protocol_clone_server = Arc::clone(&shared_protocol);
     tokio::spawn(async move {
         tracing::info!("Starting protocol server task...");
-        // タスク内部でロックを取得
-        let protocol_guard = protocol_clone_server.lock().await;
-        if let Err(e) = protocol_guard.start_server().await {
-            tracing::error!("Failed to start protocol server task: {}", e);
+        if let Err(e) = protocol_clone_server.start_server().await {
+            tracing::error!("Protocol server task failed: {}", e);
         }
-        // ロックを解放 (drop(protocol_guard) は不要、スコープを抜ければ解放される)
-        // start_server 内でループするため、通常ここには到達しない
-        tracing::info!("Protocol server task initiation complete (running in background).");
+         tracing::info!("Protocol server task finished."); // 通常は終了しない
     });
 
-    // メンテナンス処理タスク
     let protocol_clone_maintenance = Arc::clone(&shared_protocol);
     tokio::spawn(async move {
         tracing::info!("Starting protocol maintenance task...");
-        // タスク内部でロックを取得
-        let protocol_guard = protocol_clone_maintenance.lock().await;
-        if let Err(e) = protocol_guard.start_maintenance().await {
-             tracing::error!("Failed to start protocol maintenance task: {}", e);
+        if let Err(e) = protocol_clone_maintenance.start_maintenance().await {
+             tracing::error!("Protocol maintenance task failed: {}", e);
         }
-         // ロックを解放 (drop(protocol_guard) は不要)
-         // start_maintenance 内でループするため、通常ここには到達しない
-        tracing::info!("Protocol maintenance task initiation complete (running in background).");
+        tracing::info!("Protocol maintenance task finished."); // 通常は終了しない
     });
 
-    // データ受信処理タスク
     let protocol_clone_receiver = Arc::clone(&shared_protocol);
     tokio::spawn(async move {
-        tracing::info!("Starting protocol receiver task...");
-        // タスク内部でロックを取得
-        let protocol_guard = protocol_clone_receiver.lock().await;
-
-        // 非同期コールバックを定義
+        tracing::info!("Starting protocol receiver task (for server data)...");
         let callback = move |addr: SocketAddr, data: Vec<u8>| {
-            // save_document_to_db は async なので、新しいタスクで実行
+            // サーバー側で受信したデータをDBに保存
             tokio::spawn(async move {
                 save_document_to_db(addr, data).await;
             });
         };
-
-        // start_receiver を呼び出す (async になったメソッドを呼ぶ)
-        if let Err(e) = protocol_guard.start_receiver(callback).await {
-            tracing::error!("Failed to start protocol receiver task: {}", e);
+        if let Err(e) = protocol_clone_receiver.start_receiver(callback).await {
+            tracing::error!("Protocol receiver task failed: {}", e);
         }
-         // ロックを解放 (drop(protocol_guard) は不要)
-         // start_receiver 内でループするため、通常ここには到達しない
-        tracing::info!("Protocol receiver task initiation complete (running in background).");
+         tracing::info!("Protocol receiver task finished."); // 通常は終了しない
     });
 
     // --- Axum Webサーバーの設定 ---
     let app = Router::new()
         .route("/", get(root_handler))
-        // .route("/status", get(status_handler)) // 例: プロトコルの状態を表示するエンドポイント
-        // .route("/send", post(send_handler))   // 例: デバイスにメッセージを送るエンドポイント
-        .with_state(Arc::clone(&shared_protocol)); // プロトコルの状態を共有
+        // .route("/status", get(status_handler))
+        // .route("/send", post(send_handler))
+        .with_state(Arc::clone(&shared_protocol)); // 状態共有
 
     // サーバーを起動
-    tracing::info!("Web server listening on http://{}", web_bind_addr);
+    tracing::info!("Starting Web server on http://{}", web_bind_addr);
     let listener = tokio::net::TcpListener::bind(web_bind_addr).await?;
     axum::serve(listener, app).await?;
 
-    // Optional: Graceful shutdown handling for protocol tasks can be added here
-    // Example: signal handling to call protocol.stop().await
+    // 必要に応じてプロトコルの停止処理を追加
+    // shared_protocol.stop().await;
+
+    Ok(())
+}
+
+// --- クライアント実行関数 ---
+async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> std::io::Result<()> {
+    tracing::info!("Starting client mode...");
+    tracing::info!("Connecting to server: {}", server_addr_str);
+    tracing::info!("Binding local UDP to: {}", local_addr);
+    tracing::info!("Message to send: {}", message);
+
+    // --- NoiseResilientProtocol の準備 (クライアント用) ---
+    // クライアントも自身のConfigを持つことができる
+    let client_config = ConnectionConfig {
+        // 必要であればクライアント固有の設定を調整
+        connection_timeout: Duration::from_secs(10), // クライアントは少し短めにしても良いかも
+        ..Default::default()
+    };
+    // クライアントは任意のポート (例: 0.0.0.0:0) でリッスン開始
+    let protocol = NoiseResilientProtocol::with_config(local_addr, client_config).await?;
+    // クライアントは Arc<Mutex<_>> で共有する必要はないが、タスクに渡すために Arc 化
+    let protocol = Arc::new(protocol);
+
+    // --- クライアント用タスクの開始 ---
+    // クライアントもACK受信やタイムアウト処理のためにレシーバーとメンテナンスタスクが必要
+    let protocol_clone_maintenance = Arc::clone(&protocol);
+    tokio::spawn(async move {
+        tracing::info!("Starting client maintenance task...");
+        if let Err(e) = protocol_clone_maintenance.start_maintenance().await {
+             tracing::error!("Client maintenance task failed: {}", e);
+        }
+         tracing::info!("Client maintenance task finished.");
+    });
+
+    let protocol_clone_receiver = Arc::clone(&protocol);
+    tokio::spawn(async move {
+        tracing::info!("Starting client receiver task...");
+        // クライアント側での受信データ処理 (例: サーバーからの応答など)
+        let callback = move |addr: SocketAddr, data: Vec<u8>| {
+             tracing::info!("Client received data from {}: {} bytes", addr, data.len());
+             // 必要ならここで応答データを処理
+        };
+        if let Err(e) = protocol_clone_receiver.start_receiver(callback).await {
+            tracing::error!("Client receiver task failed: {}", e);
+        }
+         tracing::info!("Client receiver task finished.");
+    });
+
+
+    // --- 接続試行 ---
+    tracing::info!("Attempting to connect to {}...", server_addr_str);
+    if let Err(e) = protocol.connect(server_addr_str).await {
+        tracing::error!("Failed to initiate connection: {}", e);
+        protocol.stop().await; // 他のタスクも停止させる
+        return Err(e);
+    }
+
+    // --- 接続完了待機 ---
+    let connect_timeout = Duration::from_secs(5); // 接続試行のタイムアウト
+    let start_time = tokio::time::Instant::now();
+    loop {
+        match protocol.is_connected(server_addr_str).await {
+            Ok(true) => {
+                tracing::info!("Successfully connected to {}", server_addr_str);
+                break;
+            }
+            Ok(false) => {
+                // 接続中...
+            }
+            Err(e) => {
+                 tracing::error!("Error checking connection status: {}", e);
+                 protocol.stop().await;
+                 return Err(e);
+            }
+        }
+
+        if start_time.elapsed() > connect_timeout {
+            tracing::error!("Connection attempt timed out.");
+             protocol.stop().await;
+             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // 少し待機
+    }
+
+    // --- データ送信 ---
+    tracing::info!("Sending message: {}", message);
+    if let Err(e) = protocol.send(server_addr_str, message.as_bytes()).await {
+         tracing::error!("Failed to send message: {}", e);
+         // 送信失敗しても切断は試みる
+    } else {
+         tracing::info!("Message sent successfully.");
+         // ACKの到着を少し待つ (任意)
+         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // --- 切断 ---
+    tracing::info!("Disconnecting from {}...", server_addr_str);
+    if let Err(e) = protocol.disconnect(server_addr_str).await {
+        tracing::error!("Failed to send disconnect message: {}", e);
+    } else {
+        tracing::info!("Disconnect message sent. Waiting briefly...");
+        // 切断処理がある程度進むのを待つ（任意）
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // --- プロトコル停止 ---
+    tracing::info!("Stopping client protocol tasks...");
+    protocol.stop().await; // メンテナンスタスクなどを停止させる
+    tracing::info!("Client finished.");
 
     Ok(())
 }
@@ -135,9 +272,8 @@ async fn root_handler() -> &'static str {
 /* --- 以下、必要に応じて追加するハンドラの例 ---
 
 // プロトコルの状態を取得するハンドラ
-async fn status_handler(State(protocol_state): State<AppState>) -> String {
-    let protocol = protocol_state.lock().await;
-    // protocol から接続状態などを取得して返す (例)
+async fn status_handler(State(protocol_state): State<ServerAppState>) -> String { // State 型を更新
+    // let protocol = protocol_state.lock().await; // Mutexがなくなったのでロック不要
     // format!("Protocol status: {} active connections", protocol.active_connections_count())
     "Protocol status endpoint (implementation pending)".to_string()
 }
@@ -153,12 +289,11 @@ struct SendRequest {
 }
 
 async fn send_handler(
-    State(protocol_state): State<AppState>,
+    State(protocol_state): State<ServerAppState>, // State 型を更新
     Json(payload): Json<SendRequest>,
 ) -> Result<String, (axum::http::StatusCode, String)> { // エラーハンドリングを改善
-    let mut protocol = protocol_state.lock().await;
-    // send メソッドも async になっている想定
-    match protocol.send(&payload.target_addr, payload.message.as_bytes()).await {
+    // let mut protocol = protocol_state.lock().await; // Mutexがなくなったのでロック不要
+    match protocol_state.send(&payload.target_addr, payload.message.as_bytes()).await { // protocol_state を直接使用
         Ok(_) => Ok(format!("Message queued for {}", payload.target_addr)),
         Err(e) => {
             tracing::error!("Failed to send message to {}: {}", payload.target_addr, e);

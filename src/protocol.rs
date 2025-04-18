@@ -191,19 +191,19 @@ enum ConnectionState {
 #[derive(Clone)]
 pub struct ConnectionConfig {
     // 基本的なRTT (初期値)
-    initial_rtt: Duration,
+    pub initial_rtt: Duration,
     // 最小再送タイムアウト
-    min_rto: Duration,
+    pub min_rto: Duration,
     // 最大再送タイムアウト
-    max_rto: Duration,
+    pub max_rto: Duration,
     // 最大再送回数
-    max_retransmissions: u32,
+    pub max_retransmissions: u32,
     // 受信ウィンドウサイズ
-    receive_window_size: u32,
+    pub receive_window_size: u32,
     // 最大パケットサイズ
-    max_packet_size: usize,
+    pub max_packet_size: usize,
     // 接続タイムアウト
-    connection_timeout: Duration,
+    pub connection_timeout: Duration,
 }
 
 impl Default for ConnectionConfig {
