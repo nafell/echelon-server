@@ -298,6 +298,7 @@ impl Connection {
                 if self.state == ConnectionState::Closed {
                     self.state = ConnectionState::Connecting;
                     self.next_expected_seq = packet.header.seq_num + 1;
+                    println!("CONNECT from {}", self.peer_addr);
                     return Ok(Some(Vec::new())); // 接続要求を通知
                 }
             },
@@ -306,11 +307,13 @@ impl Connection {
                     self.state = ConnectionState::Connected;
                     // 受信確認されたパケットを削除
                     self.handle_ack(packet.header.ack_num);
+                    println!("CONNECT_ACK from {}", self.peer_addr);
                     return Ok(Some(Vec::new())); // 接続確立を通知
                 }
             },
             PacketType::Data => {
                 // 順序どおりのパケットを処理
+                println!("DATA from {}", self.peer_addr);
                 if packet.header.seq_num == self.next_expected_seq {
                     self.next_expected_seq += 1;
                     
@@ -342,9 +345,11 @@ impl Connection {
             },
             PacketType::Ack => {
                 // 受信確認処理
+                println!("ACK from {}", self.peer_addr);
                 self.handle_ack(packet.header.ack_num);
             },
             PacketType::Disconnect => {
+                println!("DISCONNECT from {}", self.peer_addr);
                 self.state = ConnectionState::Disconnecting;
                 return Ok(Some(Vec::new())); // 切断要求を通知
             }
@@ -559,6 +564,16 @@ impl NoiseResilientProtocol {
         
         Ok(())
     }
+
+    pub fn isConnected(&self, server_addr: &str) -> Result<bool, Error> {
+        let addr: SocketAddr = server_addr.parse().map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+        let connections = self.connections.lock().unwrap();
+        if let Some(connection) = connections.get(&addr) {
+            Ok(connection.state == ConnectionState::Connected)
+        } else {
+            Ok(false)
+        }
+    }
     
     // クライアントとしてデータ送信
     pub fn send(&self, server_addr: &str, data: &[u8]) -> Result<(), Error> {
@@ -601,7 +616,7 @@ impl NoiseResilientProtocol {
         }
     }
     
-    // 受信ループ開始（クライアント側）
+    // 受信ループ開始（S/C共通）
     pub fn start_receiver<F>(&self, mut callback: F) -> Result<(), Error>
     where
         F: FnMut(SocketAddr, Vec<u8>) + Send + 'static,
@@ -735,39 +750,14 @@ pub fn server() {
     server.start_server().unwrap();
     server.start_maintenance().unwrap();
 
+    server.start_receiver(|addr, data| {
+        println!("Server received data from {}: {}", addr, String::from_utf8_lossy(&data));
+    }).unwrap();
     println!("Server started, waiting for connections...");
-
-    // クライアントからの接続を待機し、接続があればメッセージ送信
-    loop {
-        let connections = server.connections.lock().unwrap();
-        if !connections.is_empty() {
-            // 接続しているクライアントのアドレスを取得
-            // この例では最初に見つかったクライアントに送信
-            if let Some(client_addr) = connections.keys().next() {
-                 let client_addr_str = client_addr.to_string();
-                 // MutexGuardを早期に解放
-                 drop(connections);
-
-                 println!("Client {} connected, sending message from server...", client_addr_str);
-                 match server.send(&client_addr_str, b"Hello from server!") {
-                     Ok(_) => println!("Server sent message to {}.", client_addr_str),
-                     Err(e) => eprintln!("Server send error to {}: {}", client_addr_str, e),
-                 }
-                 break; // 1回送信したらループを抜ける
-            } else {
-                 // MutexGuardを解放
-                 drop(connections);
-            }
-        } else {
-             // MutexGuardを解放
-             drop(connections);
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
 
     // クライアントからのメッセージ受信などを待機 (デモのためしばらく待つ)
     println!("Server waiting for client message or timeout...");
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(30));
     println!("Server shutting down.");
     server.stop();
 }
@@ -780,11 +770,11 @@ pub fn client() {
     client.start_receiver(|addr, data| {
         println!("Client received data from {}: {}", addr, String::from_utf8_lossy(&data));
     }).unwrap();
-
+    println!("Client started, waiting for connections...");
 
     println!("Client connecting to {}...", server_addr);
     match client.connect(server_addr) {
-        Ok(_) => println!("Client connection initiated."),
+        Ok(_) => println!("Client connection initiated to {}.", server_addr),
         Err(e) => {
             eprintln!("Client connect error: {}", e);
             client.stop();
@@ -792,9 +782,15 @@ pub fn client() {
         }
     }
 
-    // 接続が確立するまで少し待つ (実際の接続状態を確認する方が望ましい)
-    println!("Waiting for connection to establish...");
-    thread::sleep(Duration::from_secs(1));
+    // 接続が確立(CONNECT_ACKを受信)するまで待つ 
+    // while !client.isConnected(server_addr).unwrap() {
+    //     println!("Waiting CONNECT_ACK from {}...", server_addr);
+    //     thread::sleep(Duration::from_secs(1));
+    // }
+
+    // 接続待ち(デモ)
+    println!("Waiting for ACK...");
+    thread::sleep(Duration::from_secs(2));
 
     println!("Client sending message to {}...", server_addr);
     match client.send(server_addr, b"Hello from client!") {
@@ -802,9 +798,9 @@ pub fn client() {
         Err(e) => eprintln!("Client send error: {}", e),
     }
 
-    // サーバーからのメッセージ受信などを待機 (デモのためしばらく待つ)
-    println!("Client waiting for server message or timeout...");
+    // 送信完了を待つ
     thread::sleep(Duration::from_secs(5));
+    
     println!("Client shutting down.");
     client.stop();
 }
