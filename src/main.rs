@@ -3,6 +3,7 @@
 // fn handle_client(_stream: TcpStream) {
 // }
 mod protocol;
+mod routes;
 
 use axum::{routing::get, Router, extract::State};
 use std::net::SocketAddr;
@@ -138,10 +139,11 @@ async fn run_server(udp_bind_addr: &str, web_bind_addr: &str) -> std::io::Result
     });
 
     // --- Axum Webサーバーの設定 ---
+    let api_routes = routes::create_api_routes();
+
     let app = Router::new()
         .route("/", get(root_handler))
-        // .route("/status", get(status_handler))
-        // .route("/send", post(send_handler))
+        .merge(api_routes)
         .with_state(Arc::clone(&shared_protocol)); // 状態共有
 
     // サーバーを起動
