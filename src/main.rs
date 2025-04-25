@@ -69,7 +69,7 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> anyhow::Result<()> {
     // tracing の初期化 (ロギング用)
     tracing_subscriber::registry()
     .with(
@@ -85,7 +85,8 @@ async fn main() -> std::io::Result<()> {
 
     match args.command {
         Commands::Server { bind_addr, web_addr } => {
-            run_server(&bind_addr, &web_addr).await?;
+            run_server(&bind_addr, &web_addr).await
+                .context("Failed to run server")?;
         }
         Commands::Client { server_addr, message, local_addr } => {
             run_client(&server_addr, &message, &local_addr).await?;
@@ -179,9 +180,9 @@ async fn run_client(server_addr_str: &str, _message: &str, local_addr: &str) -> 
     tokio::spawn(async move {
         tracing::info!("Starting client maintenance task...");
         if let Err(e) = protocol_clone_maintenance.start_maintenance().await {
-             tracing::error!("Client maintenance task failed: {}", e);
+            tracing::error!("Client maintenance task failed: {}", e);
         }
-         tracing::info!("Client maintenance task finished.");
+        tracing::info!("Client maintenance task finished.");
     });
 
     let protocol_clone_receiver = Arc::clone(&protocol);
@@ -193,9 +194,13 @@ async fn run_client(server_addr_str: &str, _message: &str, local_addr: &str) -> 
         if let Err(e) = protocol_clone_receiver.start_receiver(callback).await {
             tracing::error!("Client receiver task failed: {}", e);
         }
-         tracing::info!("Client receiver task finished.");
+        tracing::info!("Client receiver task finished.");
     });
 
+    // --- 接続試行 (To Echelon Server) ---
+    tracing::info!("Attempting to connect Echelon server {}...", server_addr_str);
+    protocol.connect(server_addr_str).await
+        .with_context(|| format!("Failed to initiate connection to Echelon server {}", server_addr_str))?;
 
     // --- 接続試行 ---
     tracing::info!("Attempting to connect to {}...", server_addr_str);
@@ -211,20 +216,20 @@ async fn run_client(server_addr_str: &str, _message: &str, local_addr: &str) -> 
     loop {
         match protocol.is_connected(server_addr_str).await {
             Ok(true) => {
-                tracing::info!("Successfully connected to {}", server_addr_str);
+                tracing::info!("Successfully connected to Echelon server {}", server_addr_str);
                 break;
             }
             Ok(false) => { /* 接続中... */ }
             Err(e) => {
-                 tracing::error!("Error checking connection status: {}", e);
-                 protocol.stop().await;
-                 return Err(e);
+                tracing::error!("Error checking Echelon server connection status: {}", e);
+                protocol.stop().await; // Stop protocol tasks
+                return Err(e).context("Failed while checking Echelon server connection");
             }
         }
         if start_time.elapsed() > connect_timeout {
-            tracing::error!("Connection attempt timed out.");
-             protocol.stop().await;
-             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"));
+            tracing::error!("Echelon server connection attempt timed out.");
+            protocol.stop().await; // Stop protocol tasks
+            return Err(anyhow::anyhow!("Echelon server connection timed out")); // Use anyhow error
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -303,6 +308,7 @@ async fn run_client(server_addr_str: &str, _message: &str, local_addr: &str) -> 
 
     // 4. サーバーから切断
     tracing::info!("Disconnecting from {}...", server_addr_str);
+
     if let Err(e) = protocol.disconnect(server_addr_str).await {
         tracing::error!("Failed to send disconnect message: {}", e);
     } else {
