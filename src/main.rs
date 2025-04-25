@@ -4,13 +4,16 @@
 // }
 mod protocol;
 mod routes;
+mod ftp_client;
 
-use axum::{routing::get, Router, extract::State};
+use axum::{routing::get, Router};
 use std::net::SocketAddr;
 use std::sync::Arc; // std::sync::Arc を使用
-use tokio::sync::Mutex; // Mutex は Tokio のものを使用
 use std::time::Duration;
 use clap::Parser; // clap をインポート
+use ftp_client::{FtpReaderConfig, run_ftp_client_task};
+use tokio::sync::{mpsc, watch};
+use std::path::PathBuf;
 
 // 注意: protocol モジュール内の NoiseResilientProtocol 及び関連する型は、
 //       Tokio ベース (async/await, tokio::net::UdpSocket, tokio::time::sleep, tokio::spawn)
@@ -158,26 +161,20 @@ async fn run_server(udp_bind_addr: &str, web_bind_addr: &str) -> std::io::Result
 }
 
 // --- クライアント実行関数 ---
-async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> std::io::Result<()> {
-    tracing::info!("Starting client mode...");
+async fn run_client(server_addr_str: &str, _message: &str, local_addr: &str) -> std::io::Result<()> {
+    tracing::info!("Starting client mode (with FTP Reader)...");
     tracing::info!("Connecting to server: {}", server_addr_str);
     tracing::info!("Binding local UDP to: {}", local_addr);
-    tracing::info!("Message to send: {}", message);
 
     // --- NoiseResilientProtocol の準備 (クライアント用) ---
-    // クライアントも自身のConfigを持つことができる
     let client_config = ConnectionConfig {
-        // 必要であればクライアント固有の設定を調整
-        connection_timeout: Duration::from_secs(10), // クライアントは少し短めにしても良いかも
+        connection_timeout: Duration::from_secs(10),
         ..Default::default()
     };
-    // クライアントは任意のポート (例: 0.0.0.0:0) でリッスン開始
     let protocol = NoiseResilientProtocol::with_config(local_addr, client_config).await?;
-    // クライアントは Arc<Mutex<_>> で共有する必要はないが、タスクに渡すために Arc 化
     let protocol = Arc::new(protocol);
 
     // --- クライアント用タスクの開始 ---
-    // クライアントもACK受信やタイムアウト処理のためにレシーバーとメンテナンスタスクが必要
     let protocol_clone_maintenance = Arc::clone(&protocol);
     tokio::spawn(async move {
         tracing::info!("Starting client maintenance task...");
@@ -190,10 +187,8 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     let protocol_clone_receiver = Arc::clone(&protocol);
     tokio::spawn(async move {
         tracing::info!("Starting client receiver task...");
-        // クライアント側での受信データ処理 (例: サーバーからの応答など)
         let callback = move |addr: SocketAddr, data: Vec<u8>| {
              tracing::info!("Client received data from {}: {} bytes", addr, data.len());
-             // 必要ならここで応答データを処理
         };
         if let Err(e) = protocol_clone_receiver.start_receiver(callback).await {
             tracing::error!("Client receiver task failed: {}", e);
@@ -206,12 +201,12 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     tracing::info!("Attempting to connect to {}...", server_addr_str);
     if let Err(e) = protocol.connect(server_addr_str).await {
         tracing::error!("Failed to initiate connection: {}", e);
-        protocol.stop().await; // 他のタスクも停止させる
+        protocol.stop().await;
         return Err(e);
     }
 
     // --- 接続完了待機 ---
-    let connect_timeout = Duration::from_secs(5); // 接続試行のタイムアウト
+    let connect_timeout = Duration::from_secs(5);
     let start_time = tokio::time::Instant::now();
     loop {
         match protocol.is_connected(server_addr_str).await {
@@ -219,48 +214,105 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
                 tracing::info!("Successfully connected to {}", server_addr_str);
                 break;
             }
-            Ok(false) => {
-                // 接続中...
-            }
+            Ok(false) => { /* 接続中... */ }
             Err(e) => {
                  tracing::error!("Error checking connection status: {}", e);
                  protocol.stop().await;
                  return Err(e);
             }
         }
-
         if start_time.elapsed() > connect_timeout {
             tracing::error!("Connection attempt timed out.");
              protocol.stop().await;
              return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await; // 少し待機
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // --- データ送信 ---
-    tracing::info!("Sending message: {}", message);
-    if let Err(e) = protocol.send(server_addr_str, message.as_bytes()).await {
-         tracing::error!("Failed to send message: {}", e);
-         // 送信失敗しても切断は試みる
-    } else {
-         tracing::info!("Message sent successfully.");
-         // ACKの到着を少し待つ (任意)
-         tokio::time::sleep(Duration::from_millis(500)).await;
+    // --- FTP Reader タスクの準備と開始 ---
+    let (line_tx, mut line_rx) = mpsc::channel::<String>(100); // FTPからの行を受け取るチャンネル
+    let (shutdown_ftp_tx, shutdown_ftp_rx) = watch::channel(()); // FTPリーダー停止用チャンネル
+
+    // TODO: FTP接続情報は設定ファイルやコマンドライン引数から取得するようにする
+    let ftp_config = FtpReaderConfig {
+        host: "10.192.144.1:21".to_string(), // 例: "192.168.1.100:21"
+        user: "FTP_test".to_string(),
+        pass: "qwerty".to_string(),
+        remote_dir: "/path/to/your/logs".to_string(), // 例: "/" や "/data"
+        state_file: PathBuf::from("ftp_state.json"), // 状態ファイル名
+        line_sender: line_tx,
+        shutdown_rx: shutdown_ftp_rx,
+    };
+
+    // FTP Readerを別タスクで実行
+    let ftp_handle = tokio::spawn(run_ftp_client_task(ftp_config));
+
+
+    // --- FTPから受信した行をサーバーに送信するループ ---
+    tracing::info!("Starting loop to forward FTP lines to server...");
+    let protocol_clone_sender = Arc::clone(&protocol); // 送信用に Arc をクローン
+    let server_addr_str_clone = server_addr_str.to_string(); // ループ内で使うため clone
+
+    let forward_handle = tokio::spawn(async move {
+        while let Some(line) = line_rx.recv().await {
+            if protocol_clone_sender.is_connected(&server_addr_str_clone).await.unwrap_or(false) {
+                tracing::debug!("Forwarding line to server: {}", line);
+                if let Err(e) = protocol_clone_sender.send(&server_addr_str_clone, line.as_bytes()).await {
+                    tracing::error!("Failed to send message via protocol: {}", e);
+                    // ここで送信失敗時のリカバリー処理が必要かもしれない (例: 再接続試行など)
+                    // 今回はエラーログのみ
+                }
+                 // ACKを少し待つか、流量制御が必要なら sleep を入れる
+                 // tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                tracing::warn!("Not connected to server, cannot forward line: {}", line);
+                // サーバーへの再接続が必要かもしれない
+                // 簡単にするため、今回は破棄
+            }
+        }
+        tracing::info!("FTP line forwarding loop finished (channel closed).");
+    });
+
+
+    // --- クライアント終了処理 ---
+    // 例えば Ctrl+C を受け取るまで待機する
+    tracing::info!("Client running. Press Ctrl+C to stop.");
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("Ctrl+C received. Shutting down...");
+
+    // 1. FTPリーダーに停止信号を送る
+    tracing::info!("Sending shutdown signal to FTP reader...");
+    let _ = shutdown_ftp_tx.send(()); // エラーは無視
+
+    // 2. FTPリーダータスクの終了を待つ（タイムアウト付き）
+    tracing::info!("Waiting for FTP reader task to finish...");
+    match tokio::time::timeout(Duration::from_secs(5), ftp_handle).await {
+        Ok(Ok(_)) => tracing::info!("FTP reader task finished gracefully."),
+        Ok(Err(e)) => tracing::error!("FTP reader task panicked: {:?}", e),
+        Err(_) => tracing::warn!("FTP reader task did not finish within timeout."),
     }
 
-    // --- 切断 ---
+    // 3. 転送ループタスクの終了を待つ (チャンネルが閉じれば終わるはず)
+    tracing::info!("Waiting for forwarding task to finish...");
+     match tokio::time::timeout(Duration::from_secs(2), forward_handle).await {
+        Ok(Ok(_)) => tracing::info!("Forwarding task finished."),
+        Ok(Err(e)) => tracing::error!("Forwarding task panicked: {:?}", e),
+        Err(_) => tracing::warn!("Forwarding task did not finish within timeout."),
+    }
+
+
+    // 4. サーバーから切断
     tracing::info!("Disconnecting from {}...", server_addr_str);
     if let Err(e) = protocol.disconnect(server_addr_str).await {
         tracing::error!("Failed to send disconnect message: {}", e);
     } else {
         tracing::info!("Disconnect message sent. Waiting briefly...");
-        // 切断処理がある程度進むのを待つ（任意）
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // --- プロトコル停止 ---
+    // 5. プロトコルタスクを停止
     tracing::info!("Stopping client protocol tasks...");
-    protocol.stop().await; // メンテナンスタスクなどを停止させる
+    protocol.stop().await;
     tracing::info!("Client finished.");
 
     Ok(())
