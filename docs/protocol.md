@@ -1,6 +1,3 @@
-
-はい、承知いたしました。`src/protocol.rs` のコードに基づいた詳細な仕様書を作成します。
-
 ## `NoiseResilientProtocol` 仕様書
 
 ### 1. 概要
