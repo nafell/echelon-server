@@ -50,7 +50,7 @@
 ```mermaid
 graph TD
     subgraph Echelon Server Application
-        A[UDP Listener (NoiseResilientProtocol)] -- 受信データ --> B{データ処理};
+        A[UDP Listener / NoiseResilientProtocol] -- 受信データ --> B{データ処理};
         B -- ログ保存 --> C[(Database Placeholder)];
         D[Axum Web Server] -- HTTPリクエスト --> E{API Handlers};
         E -- プロトコル操作/状態参照 --> A;
@@ -89,7 +89,7 @@ graph TD
         NRPClientMaintenance[Protocol Maintenance Task] --> NRPClient;
         NRPClientReceiver[Protocol Receiver Task] --> NRPClient;
         NRPClient -- 接続/データ送受信 --> EchelonSrv;
-        UserCtrlC[User (Ctrl+C)] -- シャットダウンシグナル --> MainTask;
+        UserCtrlC[User: Ctrl+C] -- シャットダウンシグナル --> MainTask;
         MainTask -- shutdown_ftp_tx (watch channel) --> FTPReader;
         MainTask -- protocol.disconnect() --> EchelonSrv;
         MainTask -- protocol.stop() --> NRPClientMaintenance;
