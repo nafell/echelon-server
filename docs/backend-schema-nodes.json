@@ -1,0 +1,26 @@
+[
+    {
+        "equipment_id": "ccbb2c60-d3aa-4947-a335-3c87fa9f7805",
+        "equipment_version": "1.0",
+        "facility_name": "大阪工場",
+        "machine_type": "ギアトレイン",
+        "measurement_date": 1747202641,
+        "result": "ok"
+    },
+    {
+        "equipment_id": "fe7263bf-5700-4bc8-a090-18ebb03898d5",
+        "equipment_version": "1.0",
+        "facility_name": "北九州工場",
+        "machine_type": "ギアトレイン",
+        "measurement_date": 1747203242,
+        "result": "ng"
+    },
+    {
+        "equipment_id": "626ee256-e47e-40c3-b721-5ab673d4a320",
+        "equipment_version": "1.0",
+        "facility_name": "北九州工場",
+        "machine_type": "ギアボックス",
+        "measurement_date": 1747203843,
+        "result": "na"
+    }
+]
