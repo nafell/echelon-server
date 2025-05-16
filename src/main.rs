@@ -25,7 +25,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // DB保存処理のプレースホルダー (非同期関数として定義)
 async fn save_document_to_db(peer_addr: SocketAddr, data: Vec<u8>) {
-    // TODO: ここに実際のDB保存処理を実装する
     tracing::info!("[ECHELON] Received data from {}: {} bytes. Saving to DB (placeholder)...", peer_addr, data.len());
 
     let decoded: model::WearReading = rmp_serde::from_slice(&data).unwrap();
