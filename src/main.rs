@@ -14,6 +14,7 @@ use std::time::Duration;
 use clap::Parser; // clap をインポート
 use chrono::{DateTime, Utc};
 use influxdb::{Client, Error, InfluxDbWriteable, ReadQuery, Timestamp};
+use rmp_serde::{Deserializer, Serializer};
 
 // 注意: protocol モジュール内の NoiseResilientProtocol 及び関連する型は、
 //       Tokio ベース (async/await, tokio::net::UdpSocket, tokio::time::sleep, tokio::spawn)
@@ -27,19 +28,11 @@ async fn save_document_to_db(peer_addr: SocketAddr, data: Vec<u8>) {
     // TODO: ここに実際のDB保存処理を実装する
     tracing::info!("[ECHELON] Received data from {}: {} bytes. Saving to DB (placeholder)...", peer_addr, data.len());
 
+    let decoded: model::WearReading = rmp_serde::from_slice(&data).unwrap();
+    tracing::info!("Decoded data: {:?}", decoded);
     
     let client = Client::new("http://localhost:8086", "test");
-    let timestamp = Utc::now();
-    let ns: Vec<i32> = vec![0; 102];
-    let wear_reading = model::create_wear_reading(
-        timestamp, 
-        "大阪工場".to_string(), 
-        "ボールミル".to_string(), 
-        "PI1000-A001".to_string(), 
-        "1.0".to_string(), 
-        ns);
-    let dat = vec![wear_reading.into_query("PI1000-A001")];
-    match client.query(dat).await {
+    match client.query(decoded.into_query("PI1000-A001")).await {
         Ok(_) => {
             tracing::info!("DB save complete for measurement by: {}", peer_addr);
         }
@@ -257,9 +250,19 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
         tokio::time::sleep(Duration::from_millis(100)).await; // 少し待機
     }
 
+    // --- データシリアライズ ---
+    let measurement = model::create_wear_reading(
+        Utc::now(), 
+        "北九州工場".to_string(), 
+        "ギアトレイン".to_string(), 
+        "PI1000-A001".to_string(), 
+        "1.0".to_string(), 
+        vec![1; 102]);
+    let buf = rmp_serde::to_vec(&measurement).unwrap();
+
     // --- データ送信 ---
-    tracing::info!("Sending message: {}", message);
-    if let Err(e) = protocol.send(server_addr_str, message.as_bytes()).await {
+    tracing::info!("Sending message: {}", buf.len());
+    if let Err(e) = protocol.send(server_addr_str, &buf).await {
          tracing::error!("Failed to send message: {}", e);
          // 送信失敗しても切断は試みる
     } else {

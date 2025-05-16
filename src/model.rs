@@ -1,17 +1,18 @@
 use chrono::{DateTime, Utc};
 use influxdb::{Client, Error, InfluxDbWriteable, ReadQuery, Timestamp};
+use serde::{Deserialize, Serialize};
 
-#[derive(InfluxDbWriteable)]
+#[derive(InfluxDbWriteable, Deserialize, Serialize, Debug)]
 pub struct WearReading {
     time: DateTime<Utc>,
     #[influxdb(tag)]
-    facility_name: String,
+    pub facility_name: String,
     #[influxdb(tag)]
-    machine_type: String,
+    pub machine_type: String,
     #[influxdb(tag)]
-    equipment_id: String,
+    pub equipment_id: String,
     #[influxdb(tag)]
-    equipment_version: String,
+    pub equipment_version: String,
     n_0um: i32,
     n_1um: i32,
     n_2um: i32,
