@@ -4,6 +4,7 @@
 // }
 mod protocol;
 mod routes;
+mod model;
 
 use axum::{routing::get, Router, extract::State};
 use std::net::SocketAddr;
@@ -11,6 +12,8 @@ use std::sync::Arc; // std::sync::Arc を使用
 use tokio::sync::Mutex; // Mutex は Tokio のものを使用
 use std::time::Duration;
 use clap::Parser; // clap をインポート
+use chrono::{DateTime, Utc};
+use influxdb::{Client, Error, InfluxDbWriteable, ReadQuery, Timestamp};
 
 // 注意: protocol モジュール内の NoiseResilientProtocol 及び関連する型は、
 //       Tokio ベース (async/await, tokio::net::UdpSocket, tokio::time::sleep, tokio::spawn)
@@ -22,11 +25,28 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 // DB保存処理のプレースホルダー (非同期関数として定義)
 async fn save_document_to_db(peer_addr: SocketAddr, data: Vec<u8>) {
     // TODO: ここに実際のDB保存処理を実装する
-    // この関数は非同期である必要があるかもしれません (例: DBへの非同期I/O)
     tracing::info!("[ECHELON] Received data from {}: {} bytes. Saving to DB (placeholder)...", peer_addr, data.len());
-    // 非同期処理の例 (プレースホルダー)
-    // tokio::time::sleep(Duration::from_millis(10)).await;
-    // println!("DB save complete for {}", peer_addr);
+
+    
+    let client = Client::new("http://localhost:8086", "test");
+    let timestamp = Utc::now();
+    let ns: Vec<i32> = vec![0; 102];
+    let wear_reading = model::create_wear_reading(
+        timestamp, 
+        "大阪工場".to_string(), 
+        "ボールミル".to_string(), 
+        "PI1000-A001".to_string(), 
+        "1.0".to_string(), 
+        ns);
+    let dat = vec![wear_reading.into_query("PI1000-A001")];
+    match client.query(dat).await {
+        Ok(_) => {
+            tracing::info!("DB save complete for measurement by: {}", peer_addr);
+        }
+        Err(e) => {
+            tracing::error!("Failed to save data to DB: {}", e);
+        }
+    }
 }
 
 // アプリケーションの状態 (サーバー用)
