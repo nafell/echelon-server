@@ -50,10 +50,10 @@ struct MeasurementNodeJson {
 }
 
 async fn nodes_handler() -> Result<Json<Vec<MeasurementNodeJson>>, StatusCode> {
-    let client = Client::new("http://localhost:8086", "test");
+    let client = Client::new("http://localhost:8086", "tytc");
 
-    let result1 = get_equipment_info(&client, "SELECT * FROM \"PI1000-A001\" ORDER BY time DESC LIMIT 1".to_string()).await;
-    let result2 = get_equipment_info(&client, "SELECT * FROM \"PI1000-A002\" ORDER BY time DESC LIMIT 1".to_string()).await;
+    let result1 = get_equipment_info(&client, "SELECT * FROM wear_reading WHERE equipment_id = 'PI1000-A001' ORDER BY time DESC LIMIT 1".to_string()).await;
+    let result2 = get_equipment_info(&client, "SELECT * FROM wear_reading WHERE equipment_id = 'PI1000-A002' ORDER BY time DESC LIMIT 1".to_string()).await;
 
     let mut result_vec = Vec::new();
 
@@ -63,7 +63,6 @@ async fn nodes_handler() -> Result<Json<Vec<MeasurementNodeJson>>, StatusCode> {
         }
         Err(e) => {
             tracing::error!("Failed to read data from DB: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
     match result2 {
@@ -72,10 +71,9 @@ async fn nodes_handler() -> Result<Json<Vec<MeasurementNodeJson>>, StatusCode> {
         }
         Err(e) => {
             tracing::error!("Failed to read data from DB: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
-    
+
     Ok(Json(result_vec))
 }
 

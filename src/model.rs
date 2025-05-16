@@ -247,10 +247,10 @@ pub fn wear_string(wear_result: WearResult) -> String {
 }
 
 pub fn calc_wear(wear_reading: &WearReading) -> WearResult {
-    if wear_reading.machine_type == "ギアトレイン" {
-        calc_wear_geartrain(wear_reading)
-    } else if wear_reading.machine_type == "ボールベアリング" {
+    if wear_reading.machine_type == "ボールベアリング" {
         calc_wear_bearing(wear_reading)
+    } else if wear_reading.machine_type == "ギアトレイン" {
+        calc_wear_geartrain(wear_reading)
     } else if wear_reading.machine_type == "混合" {
         let result_bearing = calc_wear_bearing(&wear_reading);
         let result_geartrain = calc_wear_geartrain(&wear_reading);
