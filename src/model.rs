@@ -1,10 +1,10 @@
 use chrono::{DateTime, Utc};
-use influxdb::{Client, Error, InfluxDbWriteable, ReadQuery, Timestamp};
+use influxdb::{InfluxDbWriteable};
 use serde::{Deserialize, Serialize};
 
 #[derive(InfluxDbWriteable, Deserialize, Serialize, Debug)]
 pub struct WearReading {
-    time: DateTime<Utc>,
+    pub time: DateTime<Utc>,
     #[influxdb(tag)]
     pub facility_name: String,
     #[influxdb(tag)]
@@ -237,3 +237,56 @@ pub fn create_wear_reading(
     
     return wear_reading;
 }
+
+pub fn wear_string(wear_result: WearResult) -> String {
+    match wear_result {
+        WearResult::Nominal => "正常".to_string(),
+        WearResult::Warning => "警告".to_string(),
+        WearResult::Critical => "危険".to_string(),
+    }
+}
+
+pub fn calc_wear(wear_reading: &WearReading) -> WearResult {
+    if wear_reading.machine_type == "ギアトレイン" {
+        calc_wear_geartrain(wear_reading)
+    } else if wear_reading.machine_type == "ボールベアリング" {
+        calc_wear_bearing(wear_reading)
+    } else if wear_reading.machine_type == "混合" {
+        let result_bearing = calc_wear_bearing(&wear_reading);
+        let result_geartrain = calc_wear_geartrain(&wear_reading);
+        
+        if result_bearing as i32 > result_geartrain as i32 {
+            calc_wear_bearing(&wear_reading)
+        } else {
+            calc_wear_geartrain(&wear_reading)
+        }
+    } else {
+        WearResult::Nominal
+    }
+}
+
+pub fn calc_wear_bearing(wear_reading: &WearReading) -> WearResult {
+    let particle_sum:i32 = wear_reading.n_0um + wear_reading.n_1um + wear_reading.n_2um;
+    if particle_sum > 5000 {
+        WearResult::Critical
+    } else if particle_sum > 3000 {
+        WearResult::Warning
+    } else {
+        WearResult::Nominal
+    }
+}
+pub fn calc_wear_geartrain(wear_reading: &WearReading) -> WearResult {
+    let particle_sum:i32 = wear_reading.n_80um + wear_reading.n_81um + wear_reading.n_82um + wear_reading.n_83um + wear_reading.n_84um + wear_reading.n_85um + wear_reading.n_86um + wear_reading.n_87um + wear_reading.n_88um + wear_reading.n_89um + wear_reading.n_90um + wear_reading.n_91um + wear_reading.n_92um + wear_reading.n_93um + wear_reading.n_94um + wear_reading.n_95um + wear_reading.n_96um + wear_reading.n_97um + wear_reading.n_98um + wear_reading.n_99um + wear_reading.n_100um + wear_reading.n_101um;
+    if particle_sum > 0 {
+        WearResult::Critical
+    } else {
+        WearResult::Nominal
+    }
+}
+
+pub enum WearResult {
+    Nominal = 1,
+    Warning = 2,
+    Critical = 3,
+}
+
