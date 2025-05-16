@@ -54,7 +54,7 @@ async fn nodes_handler() -> Result<Json<Vec<MeasurementNodeJson>>, StatusCode> {
     // 現在はプレースホルダーデータを返す
     let client = Client::new("http://localhost:8086", "test");
 
-    let read_query = ReadQuery::new("SELECT * FROM \"PI1000-A001\"");
+    let read_query = ReadQuery::new("SELECT * FROM \"PI1000-A001\" ORDER BY time DESC LIMIT 1");
 
     let read_result = client.json_query(read_query).await.and_then(|mut res| res.deserialize_next::<WearReading>());
     
