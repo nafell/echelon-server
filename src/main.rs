@@ -29,9 +29,9 @@ async fn save_document_to_db(peer_addr: SocketAddr, data: Vec<u8>) {
 
     let decoded: model::WearReading = rmp_serde::from_slice(&data).unwrap();
     tracing::info!("Decoded data: {:?}", decoded);
-    
+    let equipment_id = decoded.equipment_id.clone();
     let client = Client::new("http://localhost:8086", "test");
-    match client.query(decoded.into_query("PI1000-A001")).await {
+    match client.query(decoded.into_query(equipment_id)).await {
         Ok(_) => {
             tracing::info!("DB save complete for measurement by: {}", peer_addr);
         }
@@ -252,9 +252,9 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     // --- データシリアライズ ---
     let measurement = model::create_wear_reading(
         Utc::now(), 
-        "北九州工場".to_string(), 
-        "ギアトレイン".to_string(), 
-        "PI1000-A001".to_string(), 
+        "大阪工場".to_string(), 
+        "ボールベアリング".to_string(), 
+        "PI1000-A002".to_string(), 
         "1.0".to_string(), 
         vec![1; 102]);
     let buf = rmp_serde::to_vec(&measurement).unwrap();
