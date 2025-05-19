@@ -153,7 +153,6 @@ async fn run_server(udp_bind_addr: &str, web_bind_addr: &str) -> std::io::Result
     let api_routes = routes::create_api_routes();
 
     let app = Router::new()
-        .route("/", get(root_handler))
         .merge(api_routes)
         .with_state(Arc::clone(&shared_protocol)); // 状態共有
 
@@ -259,7 +258,7 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     let buf = rmp_serde::to_vec(&measurement).unwrap();
 
     // --- データ送信 ---
-    tracing::info!("Sending message: {}", buf.len());
+    tracing::info!("Sending message: {} bytes", buf.len());
     if let Err(e) = protocol.send(server_addr_str, &buf).await {
          tracing::error!("Failed to send message: {}", e);
          // 送信失敗しても切断は試みる
@@ -285,11 +284,6 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     tracing::info!("Client finished.");
 
     Ok(())
-}
-
-// ルートハンドラの例
-async fn root_handler() -> &'static str {
-    "Welcome to the Echelon Server (Axum)!"
 }
 
 /* --- 以下、必要に応じて追加するハンドラの例 ---
