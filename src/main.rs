@@ -5,6 +5,7 @@
 mod protocol;
 mod routes;
 mod model;
+mod ftp;
 
 use axum::{routing::get, Router, extract::State};
 use std::net::SocketAddr;
@@ -74,6 +75,8 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0:0")]
         local_addr: String,
     },
+    Ftp {
+    },
 }
 
 #[tokio::main]
@@ -97,6 +100,9 @@ async fn main() -> std::io::Result<()> {
         }
         Commands::Client { server_addr, message, local_addr } => {
             run_client(&server_addr, &message, &local_addr).await?;
+        }
+        Commands::Ftp {  } => {
+            run_ftp().await?;
         }
     }
 
@@ -283,6 +289,24 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     protocol.stop().await; // メンテナンスタスクなどを停止させる
     tracing::info!("Client finished.");
 
+    Ok(())
+}
+
+async fn run_ftp() -> std::io::Result<()> {
+    let wear_readings_result = ftp::observe_ftp("localhost:21", "iput", "iput", "/measurements/", "北九州工場".to_string(), "ギアトレイン".to_string(), "PI1000-A001".to_string(), "1.0".to_string(), false).await;
+    match wear_readings_result {
+        Ok(wear_readings) => {
+            if wear_readings.len() > 0 {
+                tracing::info!("Wear readings length: {:?}", wear_readings.len());
+                tracing::info!("Wear reading[0]: {:?}", wear_readings[0]);
+            } else {
+                tracing::info!("No wear readings found");
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to observe FTP: {}", e);
+        }
+    }
     Ok(())
 }
 
