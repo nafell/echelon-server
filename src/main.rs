@@ -8,6 +8,7 @@ mod model;
 mod ftp;
 
 use axum::{routing::get, Router, extract::State};
+use model::WearReading;
 use std::net::SocketAddr;
 use std::sync::Arc; // std::sync::Arc を使用
 use tokio::sync::Mutex; // Mutex は Tokio のものを使用
@@ -21,7 +22,7 @@ use rmp_serde::{Deserializer, Serializer};
 //       Tokio ベース (async/await, tokio::net::UdpSocket, tokio::time::sleep, tokio::spawn)
 //       へ修正されている必要があります。
 use protocol::{NoiseResilientProtocol, ConnectionConfig}; // 必要に応じて ConnectionConfig もインポート
-
+use ftp::{FtpObservationClient, FtpObservationConfig};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // DB保存処理のプレースホルダー (非同期関数として定義)
@@ -293,20 +294,48 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
 }
 
 async fn run_ftp() -> std::io::Result<()> {
-    let wear_readings_result = ftp::observe_ftp("localhost:21", "iput", "iput", "/measurements/", "北九州工場".to_string(), "ギアトレイン".to_string(), "PI1000-A001".to_string(), "1.0".to_string(), false).await;
-    match wear_readings_result {
-        Ok(wear_readings) => {
-            if wear_readings.len() > 0 {
-                tracing::info!("Wear readings length: {:?}", wear_readings.len());
-                tracing::info!("Wear reading[0]: {:?}", wear_readings[0]);
-            } else {
-                tracing::info!("No wear readings found");
-            }
+    let ftp_config = FtpObservationConfig{
+        host: "localhost:21".into(),
+        username: "iput".into(),
+        password: "iput".into(),
+        directory: "/measurements/".into(),
+        facility_name: "北九州工場".into(),
+        machine_type: "XXXXXXX".into(),
+        equipment_id: "XXXXXXX".into(),
+        equipment_version: "XXXXXXX".into(),
+        oneshot: false
+    };
+    let ftp_client = FtpObservationClient::with_config(ftp_config);
+
+    tokio::spawn(async move {
+        let callback = move |wear_reading: Vec<WearReading>| {
+            tokio::spawn(async move {
+                // send to server
+            });
+        };
+        tracing::info!("Spawning FTP Observation Task...");
+        if let Err(e) = ftp_client.start_observation(callback).await {
+
         }
-        Err(e) => {
-            tracing::error!("Failed to observe FTP: {}", e);
-        }
-    }
+    });
+    // let wear_readings_result = ftp::observe_ftp("localhost:21", "iput", "iput", "/measurements/", "北九州工場".to_string(), "ギアトレイン".to_string(), "PI1000-A001".to_string(), "1.0".to_string(), false).await;
+    // match wear_readings_result {
+    //     Ok(wear_readings) => {
+    //         if wear_readings.len() > 0 {
+    //             tracing::info!("Wear readings length: {:?}", wear_readings.len());
+    //             tracing::info!("Wear reading[0]: {:?}", wear_readings[0]);
+    //         } else {
+    //             tracing::info!("No wear readings found");
+    //         }
+    //     }
+    //     Err(e) => {
+    //         tracing::error!("Failed to observe FTP: {}", e);
+    //     }
+    // }
+
+    // wait until user presses CTRL+C
+    tokio::signal::ctrl_c().await?;
+    
     Ok(())
 }
 

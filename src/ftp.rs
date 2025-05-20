@@ -1,10 +1,69 @@
 use async_ftp::FtpStream;
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, time::Instant, time::Duration as TokioDuration, time::sleep};
 use std::collections::HashMap;
 use chrono::{Duration};
 use std::fs::File;
 use std::io::Write;
 use crate::model::{WearReading, create_wear_reading};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[derive(Clone)]
+pub struct FtpObservationConfig{
+    pub host: String,
+    pub username: String,
+    pub password: String,
+    pub directory: String,
+    pub facility_name: String,
+    pub machine_type: String,
+    pub equipment_id: String,
+    pub equipment_version: String,
+    pub oneshot: bool,
+}
+
+pub struct FtpObservationClient{
+    config: FtpObservationConfig,
+    running: Arc<Mutex<bool>>,
+}
+
+impl FtpObservationClient{
+    pub fn with_config(config: FtpObservationConfig) -> Self {
+        Self {
+            config,
+            running: Arc::new(Mutex::new(true)),
+        }
+    }
+    
+    pub async fn start_observation<F>(&self, mut callback: F) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnMut(Vec<WearReading>) + Send + Sync + 'static,
+    {
+        let running = Arc::clone(&self.running);
+        let config = self.config.clone();
+        let interval = TokioDuration::from_millis(1000);
+
+        tokio::spawn(async move {
+            while *running.lock().await {
+                let start = Instant::now();
+
+                { // Mutexのスコープを限定
+                    tracing::info!("ftp observation task");
+                    // let mut cb_guard = callback.lock().await;
+                    // (*cb_guard)();
+                } // Mutexロック解放
+
+                let elapsed = start.elapsed();
+                if elapsed < interval {
+                    sleep(interval - elapsed).await;
+                }
+            }
+        });
+    
+        Ok(())
+    }
+    
+    
+}
 
 pub async fn list_files_by_date(
     host: &str,
