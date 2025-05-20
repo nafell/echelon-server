@@ -38,18 +38,41 @@ impl FtpObservationClient{
     where
         F: FnMut(Vec<WearReading>) + Send + Sync + 'static,
     {
+        tracing::info!("Starting FTP Observation task");
         let running = Arc::clone(&self.running);
         let config = self.config.clone();
-        let interval = TokioDuration::from_millis(1000);
+        // let callback = Arc::new(Mutex::new(callback));
+        let interval = TokioDuration::from_millis(5000);
 
         tokio::spawn(async move {
             while *running.lock().await {
                 let start = Instant::now();
 
                 { // Mutexのスコープを限定
-                    tracing::info!("ftp observation task");
-                    // let mut cb_guard = callback.lock().await;
-                    // (*cb_guard)();
+                    let wear_readings = observe_ftp(
+                        config.host.as_str(),
+                        config.username.as_str(),
+                        config.password.as_str(),
+                        config.directory.as_str(),
+                        config.facility_name.clone(),
+                        config.machine_type.clone(),
+                        config.equipment_id.clone(),
+                        config.equipment_version.clone(),
+                        config.oneshot,
+                    ).await;
+
+                    match wear_readings {
+                        Ok(wear_readings) => {
+                            if wear_readings.len() > 0 {
+                                callback(wear_readings);
+                            }
+                            tracing::info!("No wear readings found");
+                        }
+                        Err(e) => {
+                            tracing::error!("Error observing FTP: {}", e);
+                        }
+                    }
+
                 } // Mutexロック解放
 
                 let elapsed = start.elapsed();
@@ -254,5 +277,6 @@ fn save_cursor_filename_to_file(
 
 fn load_cursor_filename_from_file() -> Result<String, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string("csv_parsed_cursor.txt")?;
-    Ok(content)
+    let trimmed_newline = content.trim_end();
+    Ok(trimmed_newline.to_string())
 }
