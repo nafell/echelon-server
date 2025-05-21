@@ -6,8 +6,10 @@ mod protocol;
 mod routes;
 mod model;
 mod email;
+mod ftp;
 
 use axum::{routing::get, Router, extract::State};
+use model::WearReading;
 use std::net::SocketAddr;
 use std::sync::Arc; // std::sync::Arc を使用
 use tokio::sync::Mutex; // Mutex は Tokio のものを使用
@@ -23,12 +25,12 @@ use std::env;
 //       Tokio ベース (async/await, tokio::net::UdpSocket, tokio::time::sleep, tokio::spawn)
 //       へ修正されている必要があります。
 use protocol::{NoiseResilientProtocol, ConnectionConfig}; // 必要に応じて ConnectionConfig もインポート
-
+use ftp::{FtpObservationClient, FtpObservationConfig};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // DB保存処理のプレースホルダー (非同期関数として定義)
 async fn save_document_to_db(peer_addr: SocketAddr, data: Vec<u8>) {
-    tracing::info!("[ECHELON] Received data from {}: {} bytes. Saving to DB (placeholder)...", peer_addr, data.len());
+    tracing::info!("[ECHELON] Received data from {}: {} bytes. Saving to DB...", peer_addr, data.len());
 
     let decoded: model::WearReading = rmp_serde::from_slice(&data).unwrap();
     tracing::info!("Decoded data: {:?}", decoded);
@@ -87,6 +89,8 @@ enum Commands {
         #[arg(long, default_value = "0.0.0.0:0")]
         local_addr: String,
     },
+    Ftp {
+    },
 }
 
 #[tokio::main]
@@ -110,6 +114,9 @@ async fn main() -> std::io::Result<()> {
         }
         Commands::Client { server_addr, message, local_addr } => {
             run_client(&server_addr, &message, &local_addr).await?;
+        }
+        Commands::Ftp {  } => {
+            run_ftp().await?;
         }
     }
 
@@ -167,7 +174,6 @@ async fn run_server(udp_bind_addr: &str, web_bind_addr: &str) -> std::io::Result
     let api_routes = routes::create_api_routes();
 
     let app = Router::new()
-        .route("/", get(root_handler))
         .merge(api_routes)
         .with_state(Arc::clone(&shared_protocol)); // 状態共有
 
@@ -273,7 +279,7 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     let buf = rmp_serde::to_vec(&measurement).unwrap();
 
     // --- データ送信 ---
-    tracing::info!("Sending message: {}", buf.len());
+    tracing::info!("Sending message: {} bytes", buf.len());
     if let Err(e) = protocol.send(server_addr_str, &buf).await {
          tracing::error!("Failed to send message: {}", e);
          // 送信失敗しても切断は試みる
@@ -301,9 +307,172 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     Ok(())
 }
 
-// ルートハンドラの例
-async fn root_handler() -> &'static str {
-    "Welcome to the Echelon Server (Axum)!"
+async fn run_ftp() -> std::io::Result<()> {
+    tracing::info!("Starting ftp mode...");
+    
+    let ftp_config = FtpObservationConfig{
+        host: "localhost:21".into(),
+        username: "iput".into(),
+        password: "iput".into(),
+        directory: "/measurements/".into(),
+        facility_name: "北九州工場".into(),
+        machine_type: "XXXXXXX".into(),
+        equipment_id: "XXXXXXX".into(),
+        equipment_version: "XXXXXXX".into(),
+        oneshot: false
+    };
+    let ftp_client = FtpObservationClient::with_config(ftp_config);
+
+    tokio::spawn(async move {
+        let callback = move |wear_readings: Vec<WearReading>| {
+            tokio::spawn(async move {
+                tracing::info!("Wear reading length: {:?}", wear_readings.len());
+                // send to server
+                for wear_reading in wear_readings {
+                    client_send_message("127.0.0.1:12345", "wear_reading", "0.0.0.0:0", wear_reading).await;
+                }
+            });
+        };
+        tracing::info!("Spawning FTP Observation Task...");
+        if let Err(e) = ftp_client.start_observation(callback).await {
+            tracing::error!("Failed to start FTP observation: {}", e);
+        }
+    });
+    // let wear_readings_result = ftp::observe_ftp("localhost:21", "iput", "iput", "/measurements/", "北九州工場".to_string(), "ギアトレイン".to_string(), "PI1000-A001".to_string(), "1.0".to_string(), false).await;
+    // match wear_readings_result {
+    //     Ok(wear_readings) => {
+    //         if wear_readings.len() > 0 {
+    //             tracing::info!("Wear readings length: {:?}", wear_readings.len());
+    //             tracing::info!("Wear reading[0]: {:?}", wear_readings[0]);
+    //         } else {
+    //             tracing::info!("No wear readings found");
+    //         }
+    //     }
+    //     Err(e) => {
+    //         tracing::error!("Failed to observe FTP: {}", e);
+    //     }
+    // }
+
+    // wait until user presses CTRL+C
+    tokio::signal::ctrl_c().await?;
+    
+    Ok(())
+}
+
+// MARK: Client handler
+
+async fn client_send_message(server_addr_str: &str, message: &str, local_addr: &str, wear_reading: WearReading) -> std::io::Result<()> {
+    tracing::info!("Connecting to server: {}", server_addr_str);
+    tracing::info!("Binding local UDP to: {}", local_addr);
+    tracing::info!("Message to send: {}", message);
+
+    // --- NoiseResilientProtocol の準備 (クライアント用) ---
+    // クライアントも自身のConfigを持つことができる
+    let client_config = ConnectionConfig {
+        // 必要であればクライアント固有の設定を調整
+        connection_timeout: Duration::from_secs(10), // クライアントは少し短めにしても良いかも
+        ..Default::default()
+    };
+    // クライアントは任意のポート (例: 0.0.0.0:0) でリッスン開始
+    let protocol = NoiseResilientProtocol::with_config(local_addr, client_config).await?;
+    // クライアントは Arc<Mutex<_>> で共有する必要はないが、タスクに渡すために Arc 化
+    let protocol = Arc::new(protocol);
+
+    // --- クライアント用タスクの開始 ---
+    // クライアントもACK受信やタイムアウト処理のためにレシーバーとメンテナンスタスクが必要
+    let protocol_clone_maintenance = Arc::clone(&protocol);
+    tokio::spawn(async move {
+        tracing::info!("Starting client maintenance task...");
+        if let Err(e) = protocol_clone_maintenance.start_maintenance().await {
+             tracing::error!("Client maintenance task failed: {}", e);
+        }
+         tracing::info!("Client maintenance task finished.");
+    });
+
+    let protocol_clone_receiver = Arc::clone(&protocol);
+    tokio::spawn(async move {
+        tracing::info!("Starting client receiver task...");
+        // クライアント側での受信データ処理 (例: サーバーからの応答など)
+        let callback = move |addr: SocketAddr, data: Vec<u8>| {
+             tracing::info!("Client received data from {}: {} bytes", addr, data.len());
+             // 必要ならここで応答データを処理
+        };
+        if let Err(e) = protocol_clone_receiver.start_receiver(callback).await {
+            tracing::error!("Client receiver task failed: {}", e);
+        }
+         tracing::info!("Client receiver task finished.");
+    });
+
+
+    // --- 接続試行 ---
+    tracing::info!("Attempting to connect to {}...", server_addr_str);
+    if let Err(e) = protocol.connect(server_addr_str).await {
+        tracing::error!("Failed to initiate connection: {}", e);
+        protocol.stop().await; // 他のタスクも停止させる
+        return Err(e);
+    }
+
+    // --- 接続完了待機 ---
+    let connect_timeout = Duration::from_secs(5); // 接続試行のタイムアウト
+    let start_time = tokio::time::Instant::now();
+    loop {
+        match protocol.is_connected(server_addr_str).await {
+            Ok(true) => {
+                tracing::info!("Successfully connected to {}", server_addr_str);
+                break;
+            }
+            Ok(false) => {
+                // 接続中...
+            }
+            Err(e) => {
+                 tracing::error!("Error checking connection status: {}", e);
+                 protocol.stop().await;
+                 return Err(e);
+            }
+        }
+
+        if start_time.elapsed() > connect_timeout {
+            tracing::error!("Connection attempt timed out.");
+             protocol.stop().await;
+             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timed out"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // 少し待機
+    }
+
+    // tracing::debug!("wear_readings length: {:?}", wear_readings.len());
+
+    // for wear_reading in wear_readings {
+        tracing::info!("wear_reading: {:?}", wear_reading.time);
+        // --- データシリアライズ ---
+        let buf = rmp_serde::to_vec(&wear_reading).unwrap();
+
+        // --- データ送信 ---
+        tracing::info!("Seeending message: {} bytes", buf.len());
+        if let Err(e) = protocol.send(server_addr_str, &buf).await {
+                tracing::error!("Failed to send message: {}", e);
+                // 送信失敗しても切断は試みる
+        } else {
+                tracing::info!("Message sent successfully.");
+                // ACKの到着を少し待つ (任意)
+                tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    // }
+    // --- 切断 ---
+    tracing::info!("Disconnecting from {}...", server_addr_str);
+    if let Err(e) = protocol.disconnect(server_addr_str).await {
+        tracing::error!("Failed to send disconnect message: {}", e);
+    } else {
+        tracing::info!("Disconnect message sent. Waiting briefly...");
+        // 切断処理がある程度進むのを待つ（任意）
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // --- プロトコル停止 ---
+    tracing::info!("Stopping client protocol tasks...");
+    protocol.stop().await; // メンテナンスタスクなどを停止させる
+    tracing::info!("Client finished.");
+
+    Ok(())
 }
 
 /* --- 以下、必要に応じて追加するハンドラの例 ---
