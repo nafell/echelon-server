@@ -5,6 +5,7 @@
 mod protocol;
 mod routes;
 mod model;
+mod email;
 
 use axum::{routing::get, Router, extract::State};
 use std::net::SocketAddr;
@@ -15,6 +16,8 @@ use clap::Parser; // clap をインポート
 use chrono::{DateTime, Utc};
 use influxdb::{Client, Error, InfluxDbWriteable, ReadQuery, Timestamp};
 use rmp_serde::{Deserializer, Serializer};
+use dotenvy::dotenv;
+use std::env;
 
 // 注意: protocol モジュール内の NoiseResilientProtocol 及び関連する型は、
 //       Tokio ベース (async/await, tokio::net::UdpSocket, tokio::time::sleep, tokio::spawn)
@@ -29,6 +32,16 @@ async fn save_document_to_db(peer_addr: SocketAddr, data: Vec<u8>) {
 
     let decoded: model::WearReading = rmp_serde::from_slice(&data).unwrap();
     tracing::info!("Decoded data: {:?}", decoded);
+    let wear_result = model::calc_wear(&decoded);
+    match wear_result {
+        model::WearResult::Nominal => {
+            tracing::info!("Not sending email because wear result is nominal.");
+        }
+        _ => {
+            email::send_email(env::var("RESEND_TO_EMAIL").unwrap().as_str(), &decoded, &wear_result).await;
+        }
+    }
+
     let client = Client::new("http://localhost:8086", "tytc");
     match client.query(decoded.into_query("wear_reading")).await {
         Ok(_) => {
@@ -105,6 +118,7 @@ async fn main() -> std::io::Result<()> {
 
 // --- サーバー実行関数 ---
 async fn run_server(udp_bind_addr: &str, web_bind_addr: &str) -> std::io::Result<()> {
+    dotenv().ok();
     tracing::info!("Starting server mode...");
     tracing::info!("UDP Listening on: {}", udp_bind_addr);
     tracing::info!("Web UI Listening on: {}", web_bind_addr);
@@ -255,7 +269,7 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
         "ギアトレイン".to_string(), 
         "PI1000-A001".to_string(), 
         "1.0".to_string(), 
-        vec![1; 102]);
+        vec![0; 102]);
     let buf = rmp_serde::to_vec(&measurement).unwrap();
 
     // --- データ送信 ---
