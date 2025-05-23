@@ -275,9 +275,9 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     // --- データシリアライズ ---
     let measurement = model::create_wear_reading(
         Utc::now(), 
-        "北九州工場".to_string(), 
-        "ギアトレイン".to_string(), 
-        "PI1000-A001".to_string(), 
+        "大阪工場".to_string(), 
+        "ボールベアリング".to_string(), 
+        "PI1000-A003".to_string(), 
         "1.0".to_string(), 
         vec![0; 102]);
     let buf = rmp_serde::to_vec(&measurement).unwrap();
@@ -311,6 +311,8 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     Ok(())
 }
 
+// MARK: FTP argument
+
 async fn run_ftp(user_ftp: &str, password_ftp: &str) -> std::io::Result<()> {
     tracing::info!("Starting ftp mode...");
     
@@ -319,21 +321,30 @@ async fn run_ftp(user_ftp: &str, password_ftp: &str) -> std::io::Result<()> {
         username: user_ftp.to_string(),
         password: password_ftp.to_string(),
         directory: "source/iput/echelon-server/ftp-dir/measurements/".into(),
-        facility_name: "北九州工場".into(),
-        machine_type: "XXXXXXX".into(),
-        equipment_id: "XXXXXXX".into(),
-        equipment_version: "XXXXXXX".into(),
+        facility_name: "大阪工場".into(),
+        machine_type: "ギアトレイン".into(),
+        equipment_id: "PI1000-A002".into(),
+        equipment_version: "1.0".into(),
         oneshot: false
     };
     let ftp_client = FtpObservationClient::with_config(ftp_config);
 
     tokio::spawn(async move {
-        let callback = move |wear_readings: Vec<WearReading>| {
+        let callback = move |wear_readings: Vec<WearReading>, last_file: String| {
             tokio::spawn(async move {
                 tracing::info!("Wear reading length: {:?}", wear_readings.len());
                 // send to server
                 for wear_reading in wear_readings {
-                    client_send_message("127.0.0.1:12345", "wear_reading", "0.0.0.0:0", wear_reading).await;
+                    let last_file_clone = last_file.clone();
+                    let result =client_send_message("127.0.0.1:12345", "wear_reading", "0.0.0.0:0", wear_reading).await;
+                    match result {
+                        Ok(_) => {
+                            ftp::save_cursor_filename_to_file(last_file_clone);
+                        }
+                        Err(e) => {
+                            // tracing::error!("Failed to send wear reading: {}", e);
+                        }
+                    }
                 }
             });
         };
@@ -458,7 +469,7 @@ async fn client_send_message(server_addr_str: &str, message: &str, local_addr: &
         } else {
                 tracing::info!("Message sent successfully.");
                 // ACKの到着を少し待つ (任意)
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // tokio::time::sleep(Duration::from_millis(500)).await;
         }
     // }
     // --- 切断 ---

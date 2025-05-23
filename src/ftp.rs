@@ -36,7 +36,7 @@ impl FtpObservationClient{
     
     pub async fn start_observation<F>(&self, mut callback: F) -> Result<(), Box<dyn std::error::Error>>
     where
-        F: FnMut(Vec<WearReading>) + Send + Sync + 'static,
+        F: FnMut(Vec<WearReading>, String) + Send + Sync + 'static,
     {
         tracing::info!("Starting FTP Observation task");
         let running = Arc::clone(&self.running);
@@ -49,7 +49,7 @@ impl FtpObservationClient{
                 let start = Instant::now();
 
                 { // Mutexのスコープを限定
-                    let wear_readings = observe_ftp(
+                    let result = observe_ftp(
                         config.host.as_str(),
                         config.username.as_str(),
                         config.password.as_str(),
@@ -61,10 +61,10 @@ impl FtpObservationClient{
                         config.oneshot,
                     ).await;
 
-                    match wear_readings {
-                        Ok(wear_readings) => {
+                    match result {
+                        Ok((wear_readings, last_file)) => {
                             if wear_readings.len() > 0 {
-                                callback(wear_readings);
+                                callback(wear_readings, last_file);
                             }
                             tracing::info!("No wear readings found");
                         }
@@ -201,18 +201,28 @@ async fn parse_wear_reading_from_csv_file(
     let mut wear_readings: Vec<WearReading> = Vec::new();
     let mut lines = csv_data.lines();
     let _ = lines.next().ok_or("CSVデータが空です")?;
-
+    // tracing::debug!("[FTP Observation] lines: {:?}", lines.len());
+    let mut count = 0;
     for line in lines {
+        tracing::debug!("[FTP Observation] line: {:?}", count);
+        tracing::debug!("[FTP Observation] line: {:?}", line);
+        if count < 1 {
+            count += 1;
+            continue;
+        }
         let result = parse_wear_reading_from_csv_line(line, facility_name.clone(), machine_type.clone(), equipment_id.clone(), equipment_version.clone());
         match result {
             Ok(wear_reading) => {
+                tracing::debug!("[FTP Observation] wear_reading: {:?}", wear_reading);
                 wear_readings.push(wear_reading);
             }
             Err(e) => {
-                // tracing::error!("[FTP Observation] Error parsing CSV line: {}", e);
+                tracing::error!("[FTP Observation] Error parsing CSV line: {}", e);
             }
         }
+        count += 1;
     }
+    tracing::debug!("[FTP Observation] lines iterated: {}", wear_readings.len());
     if wear_readings.len() == 0 {
         return Err("No wear readings found".into());
     }
@@ -229,7 +239,7 @@ pub async fn observe_ftp(
     equipment_id: String,
     equipment_version: String,
     oneshot: bool,
-) -> Result<Vec<WearReading>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<WearReading>, String), Box<dyn std::error::Error>> {
     tracing::info!("Starting FTP Observation task");
     let mut last_file = load_cursor_filename_from_file()?;
     let files = list_files_by_date(host, username, password, file_path).await?;
@@ -249,7 +259,7 @@ pub async fn observe_ftp(
 
     if cursor_index >= files.len() {
         tracing::info!("[FTP Observation] No new files found");
-        return Ok(Vec::new());
+        return Ok((Vec::new(), last_file));
     }
 
     tracing::debug!("[FTP Observation] cursor_index: {}", cursor_index);
@@ -263,11 +273,11 @@ pub async fn observe_ftp(
         wear_readings.extend(wear_readings_from_file);
         last_file = file;
     }
-    save_cursor_filename_to_file(last_file)?;
-    Ok(wear_readings)
+    // save_cursor_filename_to_file(last_file)?;
+    Ok((wear_readings, last_file))
 }
 
-fn save_cursor_filename_to_file(
+pub fn save_cursor_filename_to_file(
     cursor_filename: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = File::create("csv_parsed_cursor.txt")?;
