@@ -90,6 +90,10 @@ enum Commands {
         local_addr: String,
     },
     Ftp {
+        #[arg(short, long, default_value = "iput")]
+        user_ftp: String,
+        #[arg(short, long, default_value = "iput")]
+        password_ftp: String,
     },
 }
 
@@ -115,8 +119,8 @@ async fn main() -> std::io::Result<()> {
         Commands::Client { server_addr, message, local_addr } => {
             run_client(&server_addr, &message, &local_addr).await?;
         }
-        Commands::Ftp {  } => {
-            run_ftp().await?;
+        Commands::Ftp { user_ftp, password_ftp } => {
+            run_ftp(&user_ftp, &password_ftp).await?;
         }
     }
 
@@ -307,14 +311,14 @@ async fn run_client(server_addr_str: &str, message: &str, local_addr: &str) -> s
     Ok(())
 }
 
-async fn run_ftp() -> std::io::Result<()> {
+async fn run_ftp(user_ftp: &str, password_ftp: &str) -> std::io::Result<()> {
     tracing::info!("Starting ftp mode...");
     
     let ftp_config = FtpObservationConfig{
         host: "localhost:21".into(),
-        username: "iput".into(),
-        password: "iput".into(),
-        directory: "/measurements/".into(),
+        username: user_ftp.to_string(),
+        password: password_ftp.to_string(),
+        directory: "source/iput/echelon-server/ftp-dir/measurements/".into(),
         facility_name: "北九州工場".into(),
         machine_type: "XXXXXXX".into(),
         equipment_id: "XXXXXXX".into(),
