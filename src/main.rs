@@ -71,16 +71,16 @@ enum Commands {
     /// サーバーモードで起動します
     Server {
         /// サーバーがリッスンするUDPアドレス:ポート
-        #[arg(short, long, default_value = "127.0.0.1:12345")]
+        #[arg(short, long, default_value = "0.0.0.0:12345")]
         bind_addr: String,
         /// Web UIサーバーがリッスンするTCPアドレス:ポート
-        #[arg(short, long, default_value = "127.0.0.1:8080")]
+        #[arg(short, long, default_value = "0.0.0.0:8080")]
         web_addr: String,
     },
     /// クライアントモードで起動し、メッセージを送信します
     Client {
         /// 接続先のサーバーアドレス:ポート
-        #[arg(short, long, default_value = "127.0.0.1:12345")]
+        #[arg(short, long, default_value = "0.0.0.0:12345")]
         server_addr: String,
         /// 送信するメッセージ
         #[arg(short, long, default_value = "Hello, protocol!")]
