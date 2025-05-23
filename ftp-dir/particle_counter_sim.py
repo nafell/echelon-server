@@ -24,10 +24,10 @@ def data():
 
 
 
-    values_7_to_108 = [1 for _ in range(102)]
+    values_7_to_108 = [1 for _ in range(102)] # gear_train
 
     for i in range(3):
-        values_7_to_108[i] = 1
+        values_7_to_108[i] = 1001 # ball_bearing
 
     sum_7_to_108 = sum(values_7_to_108)
     sums_10_group = [sum(values_7_to_108[i:i+10]) for i in range(0, 102, 10)]
