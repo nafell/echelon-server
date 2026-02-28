@@ -1,3 +1,5 @@
+Basic Requirements and pre-development Architecture documents are available at https://github.com/nafell/tyarchi (archived)
+
 # Noise Resilient Protocol (NRP) 仕様書
 
 ## 1. 概要
